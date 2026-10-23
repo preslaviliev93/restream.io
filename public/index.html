@@ -111,6 +111,10 @@
     <button data-tab="cmd">Command</button>
   </nav>
   <section data-pane="an">
+    <h3 class="sub">Stream format</h3>
+    <table class="fmt-table" id="dFormat"></table>
+    <p class="note">Input values are what the source declares. Output values are what ffmpeg is actually sending. Bitrates are shown when the stream reports them.</p>
+    <h3 class="sub">Live measurements</h3>
     <div class="charts">
       <figure><figcaption>Output bitrate <b id="cBitrate"></b></figcaption><canvas id="chBitrate" width="420" height="110"></canvas></figure>
       <figure><figcaption>Frame rate <b id="cFps"></b></figcaption><canvas id="chFps" width="420" height="110"></canvas></figure>

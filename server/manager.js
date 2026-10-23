@@ -19,6 +19,37 @@ const PROBLEM_RE = /error|corrupt|missing|discontinuity|non[- ]monotonic|timed o
 
 for (const d of [DATA_DIR, HLS_DIR, SDP_DIR]) fs.mkdirSync(d, { recursive: true });
 
+// Parses an ffmpeg "Stream #0:0: Video: h264 (High), yuv420p, 1920x1080, 25 fps ..." report line.
+function parseStreamLine(line) {
+  const m = /Stream #\d+:\d+[^:]*: (Video|Audio): ([^,\s(]+)(.*)$/.exec(line);
+  if (!m) return null;
+  const [, type, codec, rest] = m;
+  const bitrate = Number((/(\d+) kb\/s/.exec(rest) || [])[1]) || 0;
+  if (type === 'Video') {
+    return {
+      kind: 'video',
+      data: {
+        codec,
+        profile: (/^\s*\(([^)]*)\)/.exec(rest) || [])[1] || '',
+        pixFmt: (/,\s*((?:yuvj?|nv|gray|rgb|bgr|gbr|p0)\w*)/.exec(rest) || [])[1] || '',
+        resolution: (/\b(\d{2,5}x\d{2,5})\b/.exec(rest) || [])[1] || '',
+        aspect: (/DAR (\d+:\d+)/.exec(rest) || [])[1] || '',
+        fps: Number((/([\d.]+) fps/.exec(rest) || [])[1]) || 0,
+        bitrate,
+      },
+    };
+  }
+  return {
+    kind: 'audio',
+    data: {
+      codec,
+      sampleRate: Number((/(\d+) Hz/.exec(rest) || [])[1]) || 0,
+      channels: (/Hz, ([^,]+)/.exec(rest) || [])[1] || '',
+      bitrate,
+    },
+  };
+}
+
 const num = (v, min = 0) => {
   const n = Number(v);
   return Number.isFinite(n) && n >= min ? n : 0;
@@ -89,7 +120,8 @@ class Runner {
     this.startedAt = 0;
     this.lastProgress = 0;
     this.stats = { frame: 0, fps: 0, bitrate: 0, speed: 0, size: 0, drop: 0, dup: 0, outTime: 0 };
-    this.info = { video: null, audio: null };
+    this.info = { format: '', bitrate: 0, video: null, audio: null, outputs: [] };
+    this.curOut = null;
     this.history = [];
     this.counters = { warnings: 0, errors: 0 };
     this.lastError = '';
@@ -167,31 +199,23 @@ class Runner {
 
   onStderr(line) {
     if (!line) return;
-    if (/^Output #/.test(line)) this.inInputSection = false;
-    if (this.inInputSection) this.parseInputInfo(line);
-    this.log(line);
-  }
-
-  parseInputInfo(line) {
-    const m = /Stream #\d+:\d+[^:]*: (Video|Audio): ([^,\s(]+)(.*)$/.exec(line);
-    if (!m) return;
-    const [, kind, codec, rest] = m;
-    if (kind === 'Video' && !this.info.video) {
-      this.info.video = {
-        codec,
-        resolution: (/(\d{2,5}x\d{2,5})/.exec(rest) || [])[1] || '',
-        fps: Number((/([\d.]+) fps/.exec(rest) || [])[1]) || 0,
-        bitrate: Number((/(\d+) kb\/s/.exec(rest) || [])[1]) || 0,
-        desc: rest.replace(/^[\s,]+/, ''),
-      };
-    } else if (kind === 'Audio' && !this.info.audio) {
-      this.info.audio = {
-        codec,
-        sampleRate: Number((/(\d+) Hz/.exec(rest) || [])[1]) || 0,
-        bitrate: Number((/(\d+) kb\/s/.exec(rest) || [])[1]) || 0,
-        desc: rest.replace(/^[\s,]+/, ''),
-      };
+    let m;
+    if ((m = /^Input #0, ([^,]+),/.exec(line))) {
+      this.info.format = m[1].trim();
+    } else if ((m = /^Output #\d+, ([^,]+), to '(.*)':/.exec(line))) {
+      this.inInputSection = false;
+      this.curOut = { format: m[1].trim(), url: m[2], video: null, audio: null };
+      this.info.outputs.push(this.curOut);
+    } else if (this.inInputSection && (m = /Duration: .*?bitrate: (\d+) kb\/s/.exec(line))) {
+      this.info.bitrate = Number(m[1]);
+    } else {
+      const st = parseStreamLine(line);
+      if (st) {
+        const target = this.inInputSection ? this.info : this.curOut;
+        if (target && !target[st.kind]) target[st.kind] = st.data;
+      }
     }
+    this.log(line);
   }
 
   onProgress(line) {

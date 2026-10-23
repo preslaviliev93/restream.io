@@ -67,6 +67,7 @@ function makeCard(id) {
     <header><h3></h3><span class="badge"></span></header>
     <div class="view"><video muted autoplay playsinline controls></video><div class="ph">No preview</div></div>
     <div class="route"></div>
+    <div class="fmt"></div>
     <dl class="kpis">
       <div><dt>Bitrate</dt><dd data-k="bitrate">-</dd></div>
       <div><dt>FPS</dt><dd data-k="fps">-</dd></div>
@@ -142,6 +143,7 @@ function render() {
     $('.route', el).innerHTML = `<b>${esc(s.input.url)}</b><br>→ ${
       s.outputs.filter((o) => o.enabled).map((o) => esc(o.url)).join('<br>→ ') || '(preview only)'}
       <br>${s.video.mode === 'copy' ? 'copy' : s.video.codec} / ${s.audio.mode === 'none' ? 'no audio' : s.audio.mode === 'copy' ? 'copy' : s.audio.codec}`;
+    $('.fmt', el).textContent = rt.status === 'stopped' ? 'Not running' : formatLine(rt.info);
     const live = rt.status === 'running';
     $('[data-k=bitrate]', el).textContent = live ? fmtBitrate(rt.stats.bitrate) : '-';
     $('[data-k=fps]', el).textContent = live ? rt.stats.fps.toFixed(1) : '-';
@@ -171,6 +173,43 @@ function paintLog() {
   if (stick) pre.scrollTop = pre.scrollHeight;
 }
 
+const up = (x) => (x ? String(x).toUpperCase() : '');
+const kbps = (n) => (n ? fmtBitrate(n) : '');
+
+// One column per endpoint (input, then each output) so conversions are easy to compare.
+function renderFormatTable(s) {
+  const info = s.runtime.info;
+  const cols = [{ title: 'Input', sub: s.input.url, format: info.format, bitrate: info.bitrate, video: info.video, audio: info.audio }];
+  info.outputs.forEach((o, i) => cols.push({ title: `Output ${i + 1}`, sub: o.url, format: o.format, video: o.video, audio: o.audio }));
+  const rows = [
+    ['Container', (c) => c.format],
+    ['Total bitrate', (c) => kbps(c.bitrate)],
+    ['Video codec', (c) => up(c.video?.codec)],
+    ['Profile', (c) => c.video?.profile],
+    ['Resolution', (c) => c.video?.resolution],
+    ['Aspect ratio', (c) => c.video?.aspect],
+    ['Frame rate', (c) => (c.video?.fps ? `${c.video.fps} fps` : '')],
+    ['Pixel format', (c) => c.video?.pixFmt],
+    ['Video bitrate', (c) => kbps(c.video?.bitrate)],
+    ['Audio codec', (c) => up(c.audio?.codec)],
+    ['Sample rate', (c) => (c.audio?.sampleRate ? `${c.audio.sampleRate / 1000} kHz` : '')],
+    ['Channels', (c) => c.audio?.channels],
+    ['Audio bitrate', (c) => kbps(c.audio?.bitrate)],
+  ];
+  const cell = (v) => (v ? esc(v) : '<span class="dim">-</span>');
+  $('#dFormat').innerHTML =
+    `<thead><tr><th></th>${cols.map((c) => `<th>${c.title}<small>${esc(c.sub)}</small></th>`).join('')}</tr></thead><tbody>${
+      rows.map(([label, fn]) => `<tr><th>${label}</th>${cols.map((c) => `<td>${cell(fn(c))}</td>`).join('')}</tr>`).join('')}</tbody>`;
+}
+
+function formatLine(info) {
+  const v = info.video, a = info.audio;
+  if (!v && !a) return 'Waiting for input details...';
+  const vp = v ? [up(v.codec), v.resolution, v.fps ? `${v.fps} fps` : ''].filter(Boolean).join(' ') : 'no video';
+  const ap = a ? [up(a.codec), a.sampleRate ? `${a.sampleRate / 1000} kHz` : '', a.channels].filter(Boolean).join(' ') : 'no audio';
+  return `${vp} | ${ap}`;
+}
+
 function renderDetail() {
   const s = streams.get(detailId);
   if (!s) return $('#detailDlg').close();
@@ -187,12 +226,8 @@ function renderDetail() {
   drawChart($('#chFps'), h.map((x) => x.fps), '#3ecf8e', { min: 30, label: (v) => v.toFixed(0) + ' fps' });
   drawChart($('#chSpeed'), h.map((x) => x.speed), '#f5a524', { min: 1.5, label: (v) => v.toFixed(2) + '×' });
 
-  const v = rt.info.video, a = rt.info.audio;
+  renderFormatTable(s);
   const rows = [
-    ['Input', esc(s.input.url)],
-    ['Input video', v ? `${esc(v.codec)} ${esc(v.resolution)} ${v.fps ? v.fps + ' fps' : ''} ${v.bitrate ? v.bitrate + ' kb/s' : ''}<br><small>${esc(v.desc)}</small>` : '-'],
-    ['Input audio', a ? `${esc(a.codec)} ${a.sampleRate} Hz ${a.bitrate ? a.bitrate + ' kb/s' : ''}<br><small>${esc(a.desc)}</small>` : '-'],
-    ['Outputs', s.outputs.map((o) => `${esc(o.url)} <small style="display:inline">(${proto(o.url)}${o.enabled ? '' : ', disabled'})</small>`).join('<br>') || '-'],
     ['Frames / data sent', `${st.frame} frames · ${fmtBytes(st.size)} · ${st.outTime.toFixed(1)}s of media`],
     ['Dropped / duplicated frames', `<span class="${st.drop ? 'warn' : ''}">${st.drop}</span> / ${st.dup}`],
     ['Uptime / restarts', `${rt.uptime ? fmtUp(rt.uptime) : '-'} / ${rt.restarts}`],

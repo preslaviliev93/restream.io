@@ -79,3 +79,13 @@ menu { display: flex; justify-content: flex-end; gap: 8px; padding: 0; margin: 1
 .log.wrap { white-space: pre-wrap; height: auto; max-height: 380px; }
 .warn { color: var(--warn); }
 .bad { color: var(--bad); }
+
+.card .fmt { padding: 2px 12px 0; font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.sub { font-size: 13px; margin: 14px 0 8px; color: var(--mute); text-transform: uppercase; letter-spacing: .05em; }
+.note { color: var(--mute); font-size: 12px; margin: 6px 0 0; }
+.dim { color: var(--mute); }
+.fmt-table { width: 100%; border-collapse: collapse; background: var(--panel2); border-radius: 8px; overflow: hidden; }
+.fmt-table th, .fmt-table td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; vertical-align: top; }
+.fmt-table thead th { background: var(--bg); }
+.fmt-table th small { display: block; color: var(--mute); font-weight: 400; font-size: 11px; }
+.fmt-table tbody th { color: var(--mute); font-weight: 500; width: 130px; }
