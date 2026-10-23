@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Runtime data (saved streams, HLS segments, SDP files)
+data/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+.mcp.json

@@ -1,0 +1,17 @@
+{
+  "name": "restream-io",
+  "version": "1.0.0",
+  "description": "Web-based ffmpeg restreamer: receive, view, convert, analyse and restream multiple streams",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "hls.js": "^1.5.15",
+    "ws": "^8.18.0"
+  }
+}

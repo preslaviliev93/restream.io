@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Restream</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <h1>Restream</h1>
+  <span id="sys" class="sys">checking ffmpeg…</span>
+  <span id="conn" class="sys">offline</span>
+  <button id="newBtn" class="primary">+ New stream</button>
+</header>
+<div id="banner" class="banner" hidden></div>
+
+<main>
+  <div id="grid" class="grid"></div>
+  <p id="empty" class="empty" hidden>No streams yet. Create one, e.g. <code>rtsp://camera/stream</code> → <code>udp://239.1.1.1:5000</code>.</p>
+</main>
+
+<!-- Create / edit -->
+<dialog id="editDlg">
+  <form id="form" method="dialog">
+    <h2 id="editTitle">New stream</h2>
+    <label>Name <input name="name" placeholder="Camera 1"></label>
+
+    <fieldset>
+      <legend>Input</legend>
+      <label>URL
+        <input name="input.url" placeholder="rtsp://host/path · rtp:// · udp://@:5000 · srt://host:port · rtmp://… · http://…m3u8 · C:\file.mp4" required>
+      </label>
+      <div class="row">
+        <label data-for="rtsp">RTSP transport
+          <select name="input.rtspTransport"><option>tcp</option><option>udp</option></select>
+        </label>
+        <label data-for="file" class="check"><input type="checkbox" name="input.loop"> Loop file</label>
+        <label>Extra input args <input name="input.extra" placeholder="-analyzeduration 5M"></label>
+      </div>
+      <label data-for="rtp">SDP (required for rtp://)
+        <textarea name="input.sdp" rows="6" placeholder="v=0&#10;o=- 0 0 IN IP4 127.0.0.1&#10;s=stream&#10;c=IN IP4 0.0.0.0&#10;t=0 0&#10;m=video 5004 RTP/AVP 96&#10;a=rtpmap:96 H264/90000"></textarea>
+      </label>
+      <button type="button" id="probeBtn">Probe input</button>
+      <pre id="probeOut" hidden></pre>
+    </fieldset>
+
+    <fieldset>
+      <legend>Conversion</legend>
+      <div class="row">
+        <label>Video
+          <select name="video.mode"><option value="copy">Copy (no re-encode)</option><option value="transcode">Transcode</option></select>
+        </label>
+        <label data-for="vtx">Codec
+          <select name="video.codec"><option>libx264</option><option>libx265</option><option>h264_nvenc</option><option>hevc_nvenc</option><option>h264_qsv</option><option>h264_amf</option><option>mpeg2video</option></select>
+        </label>
+        <label data-for="vtx">Preset
+          <select name="video.preset"><option>ultrafast</option><option>superfast</option><option selected>veryfast</option><option>faster</option><option>fast</option><option>medium</option></select>
+        </label>
+      </div>
+      <div class="row" data-for="vtx">
+        <label>Bitrate kbps <input type="number" min="0" name="video.bitrate" placeholder="2500"></label>
+        <label>Width <input type="number" min="0" name="video.width" placeholder="auto"></label>
+        <label>Height <input type="number" min="0" name="video.height" placeholder="auto"></label>
+        <label>FPS <input type="number" min="0" name="video.fps" placeholder="source"></label>
+        <label>GOP <input type="number" min="0" name="video.gop" placeholder="50"></label>
+      </div>
+      <div class="row">
+        <label>Audio
+          <select name="audio.mode"><option value="copy">Copy</option><option value="transcode">Transcode</option><option value="none">Remove</option></select>
+        </label>
+        <label data-for="atx">Codec
+          <select name="audio.codec"><option>aac</option><option>mp2</option><option>ac3</option><option>libopus</option></select>
+        </label>
+        <label data-for="atx">Bitrate kbps <input type="number" min="0" name="audio.bitrate" placeholder="128"></label>
+        <label data-for="atx">Sample rate <input type="number" min="0" name="audio.sampleRate" placeholder="48000"></label>
+      </div>
+      <label>Extra output args <input name="extraOutputArgs" placeholder="-bsf:v h264_mp4toannexb"></label>
+    </fieldset>
+
+    <fieldset>
+      <legend>Outputs</legend>
+      <div id="outputs"></div>
+      <button type="button" id="addOut">+ Add output</button>
+      <small>udp:// and srt:// → MPEG-TS · rtp:// → RTP MPEG-TS · rtmp:// → FLV · rtsp:// → RTSP push · path → file by extension</small>
+    </fieldset>
+
+    <div class="row checks">
+      <label class="check"><input type="checkbox" name="preview"> Live preview (low-res HLS)</label>
+      <label class="check"><input type="checkbox" name="autoRestart"> Auto-restart</label>
+      <label class="check"><input type="checkbox" name="autoStart"> Start with server</label>
+    </div>
+
+    <p id="formErr" class="err" hidden></p>
+    <menu>
+      <button type="button" id="cancelBtn">Cancel</button>
+      <button type="submit" class="primary">Save</button>
+    </menu>
+  </form>
+</dialog>
+
+<!-- Details / analytics -->
+<dialog id="detailDlg" class="wide">
+  <div class="dhead">
+    <h2 id="dName"></h2><span id="dStatus" class="badge"></span>
+    <button id="dClose" type="button">Close</button>
+  </div>
+  <nav class="tabs">
+    <button data-tab="an" class="on">Analytics</button>
+    <button data-tab="log">Log</button>
+    <button data-tab="cmd">Command</button>
+  </nav>
+  <section data-pane="an">
+    <div class="charts">
+      <figure><figcaption>Output bitrate <b id="cBitrate"></b></figcaption><canvas id="chBitrate" width="420" height="110"></canvas></figure>
+      <figure><figcaption>Frame rate <b id="cFps"></b></figcaption><canvas id="chFps" width="420" height="110"></canvas></figure>
+      <figure><figcaption>Speed (1.0× = realtime) <b id="cSpeed"></b></figcaption><canvas id="chSpeed" width="420" height="110"></canvas></figure>
+    </div>
+    <table class="kv" id="dTable"></table>
+  </section>
+  <section data-pane="log" hidden><pre id="dLog" class="log"></pre></section>
+  <section data-pane="cmd" hidden><pre id="dCmd" class="log wrap"></pre></section>
+</dialog>
+
+<script src="/vendor/hls.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
