@@ -67,6 +67,9 @@ function sourceText(s) {
 
 // Turns raw ffmpeg messages into something a person can act on.
 const ERRORS = [
+  [/cannot load (libcuda|nvcuda|libnvidia)|no capable devices|openencodesessionex|error creating a mfx session|libmfx|unknown encoder|encoder .{0,40} not found|error while opening encoder|could not open encoder/i,
+    'The selected video encoder is not available on this server',
+    'Hardware encoders (NVENC, QSV, AMF) need a GPU the machine can use, which a virtual machine usually does not have. Edit the stream and choose a conversion preset or libx264.'],
   [/401|unauthorized|authorization failed/i, 'The login was rejected', 'Check the username and password for the source.'],
   [/connection refused/i, 'The source refused the connection', 'Check the address and port, and that the device is switched on.'],
   [/timed out|timeout|no route to host|network is unreachable/i, 'The source cannot be reached', 'Check the address and your network connection.'],
@@ -98,8 +101,16 @@ function paintAlert(el, a) {
 }
 
 /* ================= charts ================= */
-// lines: [{ values, color }]. Several lines share one scale so they can be compared directly.
-function drawChart(canvas, lines, { min = 0, label = (v) => v } = {}) {
+// Rounds a chart ceiling up to a tidy number (1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10 x 10^n) so axis labels read cleanly.
+function niceMax(v) {
+  if (!(v > 0)) return 1;
+  const p = 10 ** Math.floor(Math.log10(v));
+  return [1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10].find((f) => f * p >= v) * p;
+}
+
+// lines: [{ name, values, color }]. Several lines share one scale so they can be compared directly.
+// opts: min (smallest ceiling), label (value formatter), times (timestamps for the x axis and tooltip).
+function drawChart(canvas, lines, { min = 0, label = (v) => v, times = [] } = {}) {
   const dpr = window.devicePixelRatio || 1;
   const w = canvas.clientWidth, h = canvas.clientHeight;
   if (!w || !h) return;
@@ -107,28 +118,78 @@ function drawChart(canvas, lines, { min = 0, label = (v) => v } = {}) {
   const c = canvas.getContext('2d');
   c.setTransform(dpr, 0, 0, dpr, 0, 0);
   c.clearRect(0, 0, w, h);
+  const L = 62, R = 10, T = 10, B = 22;
+  const mute = cssVar('--mute');
+  c.font = '11px system-ui';
   const len = Math.max(...lines.map((l) => l.values.length));
-  if (len < 2) return;
-  const max = Math.max(min, ...lines.flatMap((l) => l.values)) * 1.15 || 1;
-  const x = (i) => (i / (len - 1)) * w;
-  const y = (v) => h - 2 - (v / max) * (h - 4);
-  c.strokeStyle = cssVar('--line');
-  c.lineWidth = 1;
-  for (let i = 1; i < 4; i++) { c.beginPath(); c.moveTo(0, (h / 4) * i); c.lineTo(w, (h / 4) * i); c.stroke(); }
+  if (len < 2) {
+    c.fillStyle = mute;
+    c.fillText('Collecting data...', L, h / 2);
+    canvas._chart = null;
+    return;
+  }
+  const max = niceMax(Math.max(min, ...lines.flatMap((l) => l.values)));
+  const x = (i) => L + (i / (len - 1)) * (w - L - R);
+  const y = (v) => T + (1 - v / max) * (h - T - B);
+
+  // grid and y axis labels
+  c.textAlign = 'right';
+  for (let i = 0; i <= 4; i++) {
+    const v = (max * i) / 4, yy = y(v);
+    c.strokeStyle = cssVar('--line');
+    c.lineWidth = 1;
+    c.beginPath(); c.moveTo(L, yy); c.lineTo(w - R, yy); c.stroke();
+    c.fillStyle = mute;
+    c.fillText(label(v), L - 8, yy + 4);
+  }
+  // x axis labels
+  c.textAlign = 'left';
+  c.fillStyle = mute;
+  if (times.length > 1) {
+    const secs = Math.round((times[times.length - 1] - times[0]) / 1000);
+    c.fillText(secs >= 90 ? `${Math.round(secs / 60)} min ago` : `${secs} s ago`, L, h - 6);
+  }
+  c.textAlign = 'right';
+  c.fillText('now', w - R, h - 6);
+
   lines.forEach(({ values, color }, k) => {
     c.beginPath();
     values.forEach((v, i) => (i ? c.lineTo(x(i), y(v)) : c.moveTo(x(i), y(v))));
     c.strokeStyle = color;
-    c.lineWidth = 1.8;
+    c.lineWidth = 2.4;
+    c.lineJoin = 'round';
     c.stroke();
     if (k === 0) {
-      c.lineTo(x(values.length - 1), h); c.lineTo(0, h); c.closePath();
-      c.globalAlpha = 0.13; c.fillStyle = color; c.fill(); c.globalAlpha = 1;
+      c.lineTo(x(values.length - 1), y(0)); c.lineTo(x(0), y(0)); c.closePath();
+      c.globalAlpha = 0.14; c.fillStyle = color; c.fill(); c.globalAlpha = 1;
     }
+    const last = values[values.length - 1];
+    c.beginPath(); c.arc(x(values.length - 1), y(last), 3.5, 0, Math.PI * 2); c.fillStyle = color; c.fill();
   });
-  c.fillStyle = cssVar('--mute');
-  c.font = '11px system-ui';
-  c.fillText(label(max), 4, 12);
+  canvas._chart = { lines, len, times, label, w, L, R };
+  attachTip(canvas);
+}
+
+// One hover tooltip per chart canvas, reading whatever the latest drawChart stored on it.
+function attachTip(canvas) {
+  if (canvas._tip) return;
+  const tip = document.createElement('div');
+  tip.className = 'tip';
+  tip.hidden = true;
+  canvas.parentElement.appendChild(tip);
+  canvas._tip = tip;
+  canvas.addEventListener('mousemove', (e) => {
+    const ch = canvas._chart;
+    if (!ch) return;
+    const px = e.clientX - canvas.getBoundingClientRect().left;
+    const i = Math.round(((px - ch.L) / (ch.w - ch.L - ch.R)) * (ch.len - 1));
+    if (i < 0 || i >= ch.len) { tip.hidden = true; return; }
+    tip.innerHTML = ch.lines.map((l) => `<span style="color:${l.color}">${esc(l.name)}: <b>${esc(ch.label(l.values[i] ?? 0))}</b></span>`).join('<br>')
+      + (ch.times[i] ? `<br><span class="dim">${new Date(ch.times[i]).toLocaleTimeString()}</span>` : '');
+    tip.hidden = false;
+    tip.style.left = `${Math.min(px + 14, ch.w - 150)}px`;
+  });
+  canvas.addEventListener('mouseleave', () => { tip.hidden = true; });
 }
 
 /* ================= dashboard cards ================= */
@@ -350,12 +411,13 @@ function renderDetail() {
   $('#tSpeed').textContent = live ? last.speed.toFixed(2) + 'x' : '-';
   $('#tUp').textContent = rt.uptime ? fmtUp(rt.uptime) : '-';
   $('#tRestarts').textContent = rt.restarts ? `${rt.restarts} reconnect${rt.restarts === 1 ? '' : 's'}` : 'No reconnects';
+  const times = h.map((x) => x.t);
   drawChart($('#chBitrate'), [
-    { values: h.map((x) => x.inBitrate || 0), color: cssVar('--accent') },
-    { values: h.map((x) => x.bitrate), color: cssVar('--ok') },
-  ], { label: fmtBitrate });
-  drawChart($('#chFps'), [{ values: h.map((x) => x.fps), color: cssVar('--ok') }], { min: 30, label: (v) => v.toFixed(0) + ' fps' });
-  drawChart($('#chSpeed'), [{ values: h.map((x) => x.speed), color: cssVar('--warn') }], { min: 1.5, label: (v) => v.toFixed(2) + 'x' });
+    { name: 'Input', values: h.map((x) => x.inBitrate || 0), color: cssVar('--accent') },
+    { name: 'Output', values: h.map((x) => x.bitrate), color: cssVar('--ok') },
+  ], { label: fmtBitrate, times });
+  drawChart($('#chFps'), [{ name: 'Frame rate', values: h.map((x) => x.fps), color: cssVar('--ok') }], { min: 30, label: (v) => `${+v.toFixed(1)} fps`, times });
+  drawChart($('#chSpeed'), [{ name: 'Speed', values: h.map((x) => x.speed), color: cssVar('--warn') }], { min: 1.5, label: (v) => `${v.toFixed(2)}x`, times });
 
   const err = rt.lastError ? (explain(rt.lastError)?.title || '') : '';
   const rows = [
@@ -758,9 +820,35 @@ function connect() {
   ws.onclose = () => { conn.textContent = 'Disconnected, retrying...'; conn.className = 'chip bad'; setTimeout(connect, 2000); };
 }
 
-api('GET', '/api/system').then((s) => {
-  const el = $('#sys');
-  if (s.ok) { el.textContent = s.version.split(' ').slice(0, 3).join(' '); el.className = 'chip ok'; }
-  else { el.textContent = 'ffmpeg missing'; el.className = 'chip bad'; const b = $('#banner'); b.textContent = s.error; b.hidden = false; }
-});
+// Encoders are tested by the server in the background after it starts; mark the ones that do not work here.
+function applyEncoders(enc = {}) {
+  for (const sel of [form.elements['video.codec'], form.elements['audio.codec']]) {
+    for (const o of sel.options) {
+      o.dataset.name ||= o.value;
+      const ok = enc[o.dataset.name];
+      o.value = o.dataset.name;
+      o.disabled = ok === false;
+      o.textContent = o.dataset.name + (ok === false ? ' (not available on this server)' : ok === null ? ' (checking...)' : '');
+    }
+  }
+}
+
+function loadSystem() {
+  api('GET', '/api/system').then((s) => {
+    const el = $('#sys');
+    if (s.ok) {
+      el.textContent = s.version.split(' ').slice(0, 3).join(' ');
+      el.className = 'chip ok';
+      applyEncoders(s.encoders);
+      if (Object.values(s.encoders || {}).some((v) => v === null) || !Object.keys(s.encoders || {}).length) setTimeout(loadSystem, 2000);
+    } else {
+      el.textContent = 'ffmpeg missing';
+      el.className = 'chip bad';
+      const b = $('#banner');
+      b.textContent = s.error;
+      b.hidden = false;
+    }
+  });
+}
+loadSystem();
 refresh().then(connect);

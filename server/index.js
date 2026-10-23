@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const { WebSocketServer } = require('ws');
 const report = require('./report');
-const { Manager, systemInfo, hlsStore, MEDIA_DIR, MEDIA_EXT } = require('./manager');
+const { Manager, systemInfo, detectEncoders, hlsStore, MEDIA_DIR, MEDIA_EXT } = require('./manager');
 
 const PORT = Number(process.env.PORT) || 3000;
 // Local tool that can spawn processes and read files: bind to loopback unless told otherwise.
@@ -159,6 +159,7 @@ server.listen(PORT, HOST, () => {
   if (!authEnabled && !['127.0.0.1', 'localhost', '::1'].includes(HOST)) {
     console.warn('WARNING: listening on a non-loopback address without authentication. Set AUTH_USER and AUTH_PASS.');
   }
+  detectEncoders().catch(() => {});
   manager.autoStart();
 });
 

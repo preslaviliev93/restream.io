@@ -195,3 +195,13 @@ a.btn { text-decoration: none; display: inline-block; color: inherit; }
 .metrics { gap: 14px; }
 .btn:disabled { opacity: .35; cursor: not-allowed; }
 .btn:disabled:hover { border-color: var(--line); }
+
+/* ---- charts ---- */
+.charts figure { position: relative; }
+.charts figure.wide { grid-column: 1 / -1; }
+.charts canvas { height: 150px; }
+.charts figure.wide canvas { height: 210px; }
+.charts figure.wide .legend, .charts figcaption .legend { margin-left: 10px; }
+.charts figcaption { font-size: 13px; font-weight: 600; color: var(--text); }
+.tip { position: absolute; top: 34px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; font-size: 12px; line-height: 1.5; pointer-events: none; box-shadow: 0 4px 14px rgba(0, 0, 0, .25); z-index: 3; white-space: nowrap; }
+.charts { grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); }

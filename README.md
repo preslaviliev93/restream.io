@@ -189,6 +189,7 @@ Live state is also pushed once per second over a WebSocket at `/ws`.
 ## Notes
 
 - The preview adds a second, low-resolution encode to each stream, which costs some CPU. It can be disabled per stream.
+- On start the server tests every video and audio encoder and the Custom codec lists mark the ones that do not work. Hardware encoders (NVENC, QSV, AMF) need a GPU the machine can use, so on a virtual machine without GPU passthrough only the software encoders (for example libx264) will work. A stream that fails because of an unusable encoder stops with an explanation instead of restarting forever.
 - Each destination is encoded separately, so several transcoded destinations multiply the CPU use.
 - Playlists use ffmpeg's concat demuxer, which works best when all videos share the same codec and size. Pick a re-encoding preset to mix different videos.
 - Deleting a stream keeps its recordings on disk.

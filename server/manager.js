@@ -20,11 +20,13 @@ const newReport = () => ({
   base: { bytesOut: 0, bytesIn: 0, frames: 0, drops: 0, dups: 0, media: 0 },
   series: [], events: [], msgs: new Map(),
 });
-const HISTORY_LEN = 120;
+const HISTORY_LEN = 240;
 const LOG_LEN = 500;
 const STALL_WARN_MS = 6000;
 const STALL_KILL_MS = 20000;
-const PROBLEM_RE = /error|corrupt|missing|discontinuity|non[- ]monotonic|timed out|timeout|invalid|failed|dropp?ed|overrun/i;
+// Messages that mean "this can never work with the current settings" (missing encoder or GPU), so retrying is pointless.
+const CONFIG_FATAL_RE = /cannot load (libcuda|nvcuda|libnvidia)|no capable devices|openencodesessionex|error creating a mfx session|libmfx|unknown encoder|encoder .{0,40} not found|error while opening encoder|could not open encoder/i;
+const PROBLEM_RE =/error|corrupt|missing|discontinuity|non[- ]monotonic|timed out|timeout|invalid|failed|dropp?ed|overrun/i;
 
 for (const d of [DATA_DIR, SDP_DIR]) fs.mkdirSync(d, { recursive: true });
 
@@ -214,6 +216,7 @@ class Runner {
     this.inBytes = 0;
     this.prevIn = 0;
     this.stallFlag = false;
+    this.configError = '';
     this.sampleCount = 0;
     this.info = { format: '', bitrate: 0, video: null, audio: null, outputs: [] };
     this.curOut = null;
@@ -231,6 +234,7 @@ class Runner {
   log(line) {
     if (!line) return;
     line = maskSecrets(line);
+    if (CONFIG_FATAL_RE.test(line)) this.configError = line;
     const entry = `${new Date().toISOString().slice(11, 19)} ${line}`;
     this.logs.push(entry);
     if (this.logs.length > LOG_LEN) this.logs.shift();
@@ -367,7 +371,7 @@ class Runner {
       case 'drop_frames': s.drop = num(v); break;
       case 'dup_frames': s.dup = num(v); break;
       case 'speed': s.speed = parseFloat(v) || 0; break;
-      case 'progress': this.commitSample(); break;
+      case 'progress': if (v !== 'end') this.commitSample(); break;   // the final block is printed on exit, not a sign of life
       default:
     }
   }
@@ -440,6 +444,14 @@ class Runner {
     if (!this.desired) {
       this.status = 'stopped';
       this.addEvent('Stopped', 'stopped');
+      return;
+    }
+    if (this.configError && (this.status === 'starting' || this.stats.frame === 0)) {
+      // Failed before any data flowed because of an unusable encoder or GPU: retrying would loop forever.
+      this.desired = false;
+      this.status = 'error';
+      this.lastError = this.configError;
+      this.addEvent('Stopped: the selected encoder is not available on this server', 'stopped');
       return;
     }
     if (code === 0) {
@@ -547,9 +559,23 @@ class Manager {
     return r;
   }
 
+  // Rejects an encoder that was tested and does not work here, so it fails on save instead of in a restart loop.
+  checkEncoders(cfg) {
+    const bad = (name, what) => {
+      if (encoders[name] === false) {
+        const hw = /nvenc|qsv|amf/.test(name);
+        throw new Error(`The ${what} encoder "${name}" does not work on this server.${hw ? ' Hardware encoders need a GPU that the machine can use, which a virtual machine usually does not have. Use libx264 (software) or one of the conversion presets.' : ' Choose a different codec.'}`);
+      }
+    };
+    if (cfg.video.mode === 'transcode') bad(cfg.video.codec, 'video');
+    if (cfg.audio.mode === 'transcode') bad(cfg.audio.codec, 'audio');
+  }
+
   async create(body) {
     const id = crypto.randomUUID();
-    const runner = new Runner(normalize(body, id));
+    const cfg = normalize(body, id);
+    this.checkEncoders(cfg);
+    const runner = new Runner(cfg);
     this.runners.set(id, runner);
     this.save();
     return runner.snapshot();
@@ -558,6 +584,7 @@ class Manager {
   async update(id, body) {
     const runner = this.get(id);
     const cfg = normalize(body, id, runner.cfg);
+    this.checkEncoders(cfg);
     const wasRunning = runner.desired;
     await runner.stop();
     runner.cfg = cfg;
@@ -657,13 +684,36 @@ async function probe({ url, sdp, rtspTransport, username, password }) {
   }
 }
 
+// ---- encoder availability ----
+// ffmpeg lists hardware encoders (NVENC, QSV, AMF) even on machines without the hardware, so each one is
+// tried on a tiny test clip. true = works, false = fails, null = still being tested.
+const ENCODER_LIST = {
+  video: ['libx264', 'libx265', 'mpeg2video', 'h264_nvenc', 'hevc_nvenc', 'h264_qsv', 'h264_amf'],
+  audio: ['aac', 'mp2', 'ac3', 'libopus'],
+};
+const encoders = {};
+
+function testEncoder(name, kind) {
+  const src = kind === 'video' ? ['-f', 'lavfi', '-i', 'color=c=black:s=640x360:r=25', '-frames:v', '5', '-c:v', name]
+    : ['-f', 'lavfi', '-i', 'sine=frequency=440:d=0.3', '-c:a', name];
+  return new Promise((resolve) => {
+    execFile(FFMPEG, ['-hide_banner', '-v', 'error', ...src, '-f', 'null', '-'], { timeout: 20000, windowsHide: true }, (err) => resolve(!err));
+  });
+}
+
+async function detectEncoders() {
+  const all = Object.entries(ENCODER_LIST).flatMap(([kind, names]) => names.map((n) => [n, kind]));
+  all.forEach(([n]) => { encoders[n] = null; });
+  for (const [name, kind] of all) encoders[name] = await testEncoder(name, kind);
+}
+
 async function systemInfo() {
   try {
     const out = await run(FFMPEG, ['-version'], 5000);
-    return { ok: true, version: out.split('\n')[0] };
+    return { ok: true, version: out.split('\n')[0], encoders: { ...encoders } };
   } catch (e) {
     return { ok: false, error: `ffmpeg not found (${FFMPEG}). Install it or set FFMPEG_PATH.` };
   }
 }
 
-module.exports = { Manager, probe, systemInfo, hlsStore, MEDIA_DIR, MEDIA_EXT };
+module.exports = { Manager, probe, systemInfo, detectEncoders, hlsStore, MEDIA_DIR, MEDIA_EXT };
