@@ -8,122 +8,256 @@
 </head>
 <body>
 <header class="top">
-  <h1>Restream</h1>
-  <span id="sys" class="sys">checking ffmpeg…</span>
-  <span id="conn" class="sys">offline</span>
-  <button id="newBtn" class="primary">+ New stream</button>
+  <div class="brand">Restream</div>
+  <span id="summary" class="summary"></span>
+  <span class="sp"></span>
+  <span id="sys" class="chip">checking ffmpeg...</span>
+  <span id="conn" class="chip">connecting...</span>
+  <button id="newBtn" class="btn primary">New stream</button>
 </header>
 <div id="banner" class="banner" hidden></div>
 
 <main>
   <div id="grid" class="grid"></div>
-  <p id="empty" class="empty" hidden>No streams yet. Create one, e.g. <code>rtsp://camera/stream</code> → <code>udp://239.1.1.1:5000</code>.</p>
+  <div id="empty" class="empty" hidden>
+    <h2>No streams yet</h2>
+    <p>Take a stream from a camera or server, optionally convert it, and send it somewhere else.</p>
+    <button class="btn primary" id="emptyBtn">Create your first stream</button>
+  </div>
 </main>
 
-<!-- Create / edit -->
+<!-- ============ Create / edit ============ -->
 <dialog id="editDlg">
-  <form id="form" method="dialog">
-    <h2 id="editTitle">New stream</h2>
-    <label>Name <input name="name" placeholder="Camera 1"></label>
-
-    <fieldset>
-      <legend>Input</legend>
-      <label>URL
-        <input name="input.url" placeholder="rtsp://host/path · rtp:// · udp://@:5000 · srt://host:port · rtmp://… · http://…m3u8 · C:\file.mp4" required>
-      </label>
-      <div class="row">
-        <label data-for="rtsp">RTSP transport
-          <select name="input.rtspTransport"><option>tcp</option><option>udp</option></select>
-        </label>
-        <label data-for="file" class="check"><input type="checkbox" name="input.loop"> Loop file</label>
-        <label>Extra input args <input name="input.extra" placeholder="-analyzeduration 5M"></label>
-      </div>
-      <label data-for="rtp">SDP (required for rtp://)
-        <textarea name="input.sdp" rows="6" placeholder="v=0&#10;o=- 0 0 IN IP4 127.0.0.1&#10;s=stream&#10;c=IN IP4 0.0.0.0&#10;t=0 0&#10;m=video 5004 RTP/AVP 96&#10;a=rtpmap:96 H264/90000"></textarea>
-      </label>
-      <button type="button" id="probeBtn">Probe input</button>
-      <pre id="probeOut" hidden></pre>
-    </fieldset>
-
-    <fieldset>
-      <legend>Conversion</legend>
-      <div class="row">
-        <label>Video
-          <select name="video.mode"><option value="copy">Copy (no re-encode)</option><option value="transcode">Transcode</option></select>
-        </label>
-        <label data-for="vtx">Codec
-          <select name="video.codec"><option>libx264</option><option>libx265</option><option>h264_nvenc</option><option>hevc_nvenc</option><option>h264_qsv</option><option>h264_amf</option><option>mpeg2video</option></select>
-        </label>
-        <label data-for="vtx">Preset
-          <select name="video.preset"><option>ultrafast</option><option>superfast</option><option selected>veryfast</option><option>faster</option><option>fast</option><option>medium</option></select>
-        </label>
-      </div>
-      <div class="row" data-for="vtx">
-        <label>Bitrate kbps <input type="number" min="0" name="video.bitrate" placeholder="2500"></label>
-        <label>Width <input type="number" min="0" name="video.width" placeholder="auto"></label>
-        <label>Height <input type="number" min="0" name="video.height" placeholder="auto"></label>
-        <label>FPS <input type="number" min="0" name="video.fps" placeholder="source"></label>
-        <label>GOP <input type="number" min="0" name="video.gop" placeholder="50"></label>
-      </div>
-      <div class="row">
-        <label>Audio
-          <select name="audio.mode"><option value="copy">Copy</option><option value="transcode">Transcode</option><option value="none">Remove</option></select>
-        </label>
-        <label data-for="atx">Codec
-          <select name="audio.codec"><option>aac</option><option>mp2</option><option>ac3</option><option>libopus</option></select>
-        </label>
-        <label data-for="atx">Bitrate kbps <input type="number" min="0" name="audio.bitrate" placeholder="128"></label>
-        <label data-for="atx">Sample rate <input type="number" min="0" name="audio.sampleRate" placeholder="48000"></label>
-      </div>
-      <label>Extra output args <input name="extraOutputArgs" placeholder="-bsf:v h264_mp4toannexb"></label>
-    </fieldset>
-
-    <fieldset>
-      <legend>Outputs</legend>
-      <div id="outputs"></div>
-      <button type="button" id="addOut">+ Add output</button>
-      <small>udp:// and srt:// → MPEG-TS · rtp:// → RTP MPEG-TS · rtmp:// → FLV · rtsp:// → RTSP push · path → file by extension</small>
-    </fieldset>
-
-    <div class="row checks">
-      <label class="check"><input type="checkbox" name="preview"> Live preview (low-res HLS)</label>
-      <label class="check"><input type="checkbox" name="autoRestart"> Auto-restart</label>
-      <label class="check"><input type="checkbox" name="autoStart"> Start with server</label>
+  <form id="form" novalidate>
+    <div class="dlg-head">
+      <h2 id="editTitle">New stream</h2>
+      <ol class="steps" id="steps">
+        <li data-go="1"><span>1</span>Source</li>
+        <li data-go="2"><span>2</span>Convert</li>
+        <li data-go="3"><span>3</span>Destination</li>
+      </ol>
     </div>
 
+    <!-- Step 1 -->
+    <section class="step" data-step="1">
+      <label>Name
+        <input name="name" placeholder="Front door camera">
+      </label>
+      <div class="seg" id="srcType">
+        <label><input type="radio" name="_src" value="url" checked> Network stream or address</label>
+        <label><input type="radio" name="_src" value="media"> Video stored on this server</label>
+      </div>
+      <div data-src="url">
+      <label>Where does the stream come from?
+        <input name="input.url" placeholder="rtsp://192.168.1.50/stream1" required>
+        <small>Works with rtsp://, rtmp://, srt://, udp://@:5000, http(s) HLS links, rtp:// (with SDP) or a file path.</small>
+      </label>
+      <div class="two" data-for="auth">
+        <label>Username <small class="inline">(if it needs a login)</small>
+          <input name="input.username" autocomplete="off">
+        </label>
+        <label>Password
+          <input type="password" name="input.password" autocomplete="new-password" id="inPass">
+        </label>
+      </div>
+      <label data-for="rtp">SDP description (required for rtp://)
+        <textarea name="input.sdp" rows="6" placeholder="v=0&#10;o=- 0 0 IN IP4 127.0.0.1&#10;s=stream&#10;c=IN IP4 0.0.0.0&#10;t=0 0&#10;m=video 5004 RTP/AVP 96&#10;a=rtpmap:96 H264/90000"></textarea>
+      </label>
+      <div class="probe">
+        <button type="button" class="btn" id="probeBtn">Test connection</button>
+        <div id="probeOut" class="probe-out" hidden></div>
+      </div>
+      </div>
+
+      <div data-src="media" hidden>
+        <p class="lead">Choose the videos to stream</p>
+        <div id="mediaList" class="media-list"></div>
+        <div class="media-actions">
+          <button type="button" class="btn" id="mediaUpBtn">Upload video</button>
+          <input type="file" id="mediaFile" accept="video/*,.mkv,.ts" multiple hidden>
+          <span id="mediaProg" class="note"></span>
+        </div>
+        <small>Select several videos to play them one after another, in the order you click them. For a smooth playlist use videos with the same format and size, or pick a re-encoding option in the next step.</small>
+      </div>
+
+      <label class="toggle" data-for="loop"><input type="checkbox" name="input.loop"><span><b>Loop forever</b> - start again from the beginning when the video ends, so the stream never stops</span></label>
+
+      <details>
+        <summary>More source options</summary>
+        <div class="two">
+          <label data-for="rtsp">RTSP transport
+            <select name="input.rtspTransport"><option value="tcp">TCP (most reliable)</option><option value="udp">UDP</option></select>
+          </label>
+          <label>Extra ffmpeg input options
+            <input name="input.extra" placeholder="-analyzeduration 5M">
+          </label>
+        </div>
+      </details>
+    </section>
+
+    <!-- Step 2 -->
+    <section class="step" data-step="2" hidden>
+      <p class="lead">What should happen to the video and audio on the way through?</p>
+      <div class="presets" id="presets">
+        <label class="preset"><input type="radio" name="_preset" value="audio_fix">
+          <b>Keep video, fix audio <em>Recommended</em></b>
+          <span>The video is passed through untouched (no quality loss, very low CPU). Audio is converted to AAC so any destination accepts it.</span></label>
+        <label class="preset"><input type="radio" name="_preset" value="original">
+          <b>Pass through unchanged</b>
+          <span>Nothing is converted. Lowest CPU use, but it fails if a destination cannot carry a codec, for example camera PCM audio into UDP.</span></label>
+        <label class="preset"><input type="radio" name="_preset" value="hd720">
+          <b>Convert to 720p</b>
+          <span>Re-encodes to H.264 1280x720 at 2.5 Mb/s with AAC audio. Good for slower links. Uses more CPU.</span></label>
+        <label class="preset"><input type="radio" name="_preset" value="hd1080">
+          <b>Convert to 1080p</b>
+          <span>Re-encodes to H.264 1920x1080 at 5 Mb/s with AAC audio. Uses more CPU.</span></label>
+        <label class="preset"><input type="radio" name="_preset" value="custom">
+          <b>Custom</b>
+          <span>Choose codecs, bitrate, resolution and frame rate yourself.</span></label>
+      </div>
+
+      <div id="customConv" hidden>
+        <h4>Video</h4>
+        <div class="grid3">
+          <label>Mode
+            <select name="video.mode"><option value="copy">Copy (no re-encode)</option><option value="transcode">Re-encode</option></select>
+          </label>
+          <label data-for="vtx">Codec
+            <select name="video.codec"><option>libx264</option><option>libx265</option><option>h264_nvenc</option><option>hevc_nvenc</option><option>h264_qsv</option><option>h264_amf</option><option>mpeg2video</option></select>
+          </label>
+          <label data-for="vtx">Speed vs quality
+            <select name="video.preset"><option>ultrafast</option><option>superfast</option><option>veryfast</option><option>faster</option><option>fast</option><option>medium</option></select>
+          </label>
+        </div>
+        <div class="grid5" data-for="vtx">
+          <label>Bitrate (kb/s)<input type="number" min="0" name="video.bitrate" placeholder="2500"></label>
+          <label>Width<input type="number" min="0" name="video.width" placeholder="auto"></label>
+          <label>Height<input type="number" min="0" name="video.height" placeholder="auto"></label>
+          <label>Frame rate<input type="number" min="0" name="video.fps" placeholder="as source"></label>
+          <label>Keyframe every<input type="number" min="0" name="video.gop" placeholder="50 frames"></label>
+        </div>
+        <h4>Audio</h4>
+        <div class="grid3">
+          <label>Mode
+            <select name="audio.mode"><option value="copy">Copy</option><option value="transcode">Convert</option><option value="none">Remove audio</option></select>
+          </label>
+          <label data-for="atx">Codec
+            <select name="audio.codec"><option>aac</option><option>mp2</option><option>ac3</option><option>libopus</option></select>
+          </label>
+          <label data-for="atx">Bitrate (kb/s)<input type="number" min="0" name="audio.bitrate" placeholder="128"></label>
+        </div>
+        <label data-for="atx" class="narrow">Sample rate (Hz)<input type="number" min="0" name="audio.sampleRate" placeholder="as source"></label>
+      </div>
+    </section>
+
+    <!-- Step 3 -->
+    <section class="step" data-step="3" hidden>
+      <p class="lead">Where should the stream be sent?</p>
+      <div id="dests"></div>
+      <button type="button" class="btn" id="addDest">Add another destination</button>
+
+      <h4>Also</h4>
+      <label class="toggle"><input type="checkbox" name="preview"><span><b>Show a live preview</b> on the dashboard (low resolution, costs some CPU)</span></label>
+      <label class="toggle"><input type="checkbox" name="record.enabled" id="recOn"><span><b>Save a copy to disk</b> (recording)</span></label>
+      <div class="indent" id="recOpts" hidden>
+        <div class="two">
+          <label>File format
+            <select name="record.format"><option value="mkv">MKV - safest if something crashes</option><option value="mp4">MP4 - plays everywhere</option><option value="ts">TS - broadcast style</option></select>
+          </label>
+          <label>Split into files
+            <select name="record.splitMinutes"><option value="0">One file per run</option><option value="10">Every 10 minutes</option><option value="30">Every 30 minutes</option><option value="60">Every hour</option></select>
+          </label>
+        </div>
+        <small>Recordings use the same conversion as chosen in step 2 and can be downloaded from the stream's Details, under Recordings.</small>
+      </div>
+
+      <details>
+        <summary>More options</summary>
+        <label class="toggle"><input type="checkbox" name="autoRestart"><span><b>Reconnect automatically</b> if the source drops</span></label>
+        <label class="toggle"><input type="checkbox" name="autoStart"><span><b>Start when the server starts</b></span></label>
+        <label>Extra ffmpeg output options
+          <input name="extraOutputArgs" placeholder="-bsf:v h264_mp4toannexb">
+        </label>
+      </details>
+    </section>
+
     <p id="formErr" class="err" hidden></p>
-    <menu>
-      <button type="button" id="cancelBtn">Cancel</button>
-      <button type="submit" class="primary">Save</button>
-    </menu>
+    <div class="dlg-foot">
+      <button type="button" class="btn danger-text" id="delBtn" hidden>Delete stream</button>
+      <span class="sp"></span>
+      <button type="button" class="btn" id="cancelBtn">Cancel</button>
+      <button type="button" class="btn" id="backBtn">Back</button>
+      <button type="button" class="btn primary" id="nextBtn">Next</button>
+      <button type="submit" class="btn primary" id="saveBtn">Save</button>
+    </div>
   </form>
 </dialog>
 
-<!-- Details / analytics -->
+<!-- ============ Details ============ -->
 <dialog id="detailDlg" class="wide">
   <div class="dhead">
-    <h2 id="dName"></h2><span id="dStatus" class="badge"></span>
-    <button id="dClose" type="button">Close</button>
+    <div>
+      <h2 id="dName"></h2>
+      <p class="route" id="dRoute"></p>
+    </div>
+    <span class="sp"></span>
+    <span id="dStatus" class="pill"></span>
+    <button id="dClose" type="button" class="btn">Close</button>
   </div>
   <nav class="tabs">
-    <button data-tab="an" class="on">Analytics</button>
+    <button data-tab="ov" class="on">Overview</button>
+    <button data-tab="rep">Report</button>
+    <button data-tab="fmt">Format</button>
+    <button data-tab="rec">Recordings</button>
     <button data-tab="log">Log</button>
-    <button data-tab="cmd">Command</button>
   </nav>
-  <section data-pane="an">
-    <h3 class="sub">Stream format</h3>
-    <table class="fmt-table" id="dFormat"></table>
-    <p class="note">Input values are what the source declares. Output values are what ffmpeg is actually sending. Bitrates are shown when the stream reports them.</p>
-    <h3 class="sub">Live measurements</h3>
-    <div class="charts">
-      <figure><figcaption>Output bitrate <b id="cBitrate"></b></figcaption><canvas id="chBitrate" width="420" height="110"></canvas></figure>
-      <figure><figcaption>Frame rate <b id="cFps"></b></figcaption><canvas id="chFps" width="420" height="110"></canvas></figure>
-      <figure><figcaption>Speed (1.0× = realtime) <b id="cSpeed"></b></figcaption><canvas id="chSpeed" width="420" height="110"></canvas></figure>
+
+  <section data-pane="ov">
+    <div id="dAlert" class="alert" hidden></div>
+    <div class="tiles">
+      <div class="tile"><span>Input bitrate</span><b id="tInBitrate">-</b><small>Measured on the incoming stream</small></div>
+      <div class="tile"><span>Output bitrate</span><b id="tBitrate">-</b><small>Measured on the first destination</small></div>
+      <div class="tile"><span>Frame rate</span><b id="tFps">-</b><small>Frames per second</small></div>
+      <div class="tile"><span>Speed</span><b id="tSpeed">-</b><small>1.00x means real time</small></div>
+      <div class="tile"><span>Running for</span><b id="tUp">-</b><small id="tRestarts"></small></div>
     </div>
+    <div class="charts">
+      <figure><figcaption>Bitrate <span class="legend"><span class="key k1">Input</span><span class="key k2">Output</span></span></figcaption><canvas id="chBitrate"></canvas></figure>
+      <figure><figcaption>Frame rate</figcaption><canvas id="chFps"></canvas></figure>
+      <figure><figcaption>Speed</figcaption><canvas id="chSpeed"></canvas></figure>
+    </div>
+    <h4>Health</h4>
     <table class="kv" id="dTable"></table>
   </section>
-  <section data-pane="log" hidden><pre id="dLog" class="log"></pre></section>
-  <section data-pane="cmd" hidden><pre id="dCmd" class="log wrap"></pre></section>
+
+  <section data-pane="rep" hidden>
+    <div class="rep-bar">
+      <button type="button" class="btn sm" id="repRefresh">Refresh</button>
+      <a class="btn sm" id="repOpen" target="_blank" rel="noopener">Open in new tab</a>
+      <a class="btn sm" id="repDl">Download report</a>
+      <a class="btn sm" id="repJson">Data (JSON)</a>
+      <a class="btn sm" id="repCsv">Samples (CSV)</a>
+    </div>
+    <iframe id="repFrame" title="Analytics report"></iframe>
+  </section>
+
+  <section data-pane="fmt" hidden>
+    <table class="fmt-table" id="dFormat"></table>
+    <p class="note">Input shows what the source declares. Each output shows what is actually being sent after conversion. A dash means the stream does not report that value.</p>
+  </section>
+
+  <section data-pane="rec" hidden>
+    <div id="recSummary" class="note"></div>
+    <div id="recList"></div>
+  </section>
+
+  <section data-pane="log" hidden>
+    <details>
+      <summary>ffmpeg command line</summary>
+      <pre id="dCmd" class="log wrap"></pre>
+    </details>
+    <pre id="dLog" class="log"></pre>
+  </section>
 </dialog>
 
 <script src="/vendor/hls.js"></script>
