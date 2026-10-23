@@ -38,11 +38,11 @@ const up = (x) => (x ? String(x).toUpperCase() : '');
 const kbps = (n) => (n ? fmtBitrate(n) : '');
 
 const STATUS_TEXT = {
-  running: 'Live', starting: 'Connecting', restarting: 'Reconnecting', stopping: 'Stopping',
+  running: 'Live', starting: 'Connecting', restarting: 'Reconnecting', stopping: 'Stopping', waiting: 'Waiting',
   stopped: 'Stopped', error: 'Error', stalled: 'No data',
 };
 const statusOf = (s) => (s.runtime.stalled ? 'stalled' : s.runtime.status);
-const isActive = (s) => ['running', 'starting', 'restarting'].includes(s.runtime.status);
+const isActive = (s) => ['running', 'starting', 'restarting', 'waiting'].includes(s.runtime.status);
 
 const PROTO_LABEL = { rtsp: 'RTSP', rtsps: 'RTSP', rtmp: 'RTMP', rtmps: 'RTMP', srt: 'SRT', udp: 'UDP', rtp: 'RTP', http: 'HTTP', https: 'HTTP', tcp: 'TCP' };
 function describe(url) {
@@ -60,6 +60,7 @@ function routeText(s) {
 }
 
 function sourceText(s) {
+  if (s.input.type === 'listen') return `Waiting for a ${s.input.listen.protocol.toUpperCase()} push on port ${s.input.listen.port}`;
   if (s.input.type !== 'media') return describe(s.input.url);
   const f = s.input.files || [];
   return `Server video ${f[0] || ''}${f.length > 1 ? ` +${f.length - 1} more` : ''}${s.input.loop ? ', looping' : ''}`;
@@ -79,13 +80,22 @@ const ERRORS = [
   [/address already in use|bind failed/i, 'That port is already in use', 'Choose a different port.'],
   [/invalid data found/i, 'The source sent data that cannot be read', 'Check that the address points to a real video stream.'],
   [/protocol not found/i, 'Unsupported address type', 'Check the address starts with a supported prefix such as rtsp://.'],
+  [/fontconfig|cannot find a valid font|could not load font|error initializing filter 'drawtext'/i, 'The text overlay needs a font', 'Install a font on the server (on Debian or Ubuntu: apt install fonts-dejavu-core), or set the FONT_FILE variable.'],
+  [/error opening output|error number -138|connection to .* failed/i, 'The destination cannot be reached', 'Check the address and port, and that something is listening there.'],
 ];
 function explain(text) {
   const hit = ERRORS.find(([re]) => re.test(text || ''));
   return hit ? { title: hit[1], hint: hit[2] } : null;
 }
+function pushAddress(s) {
+  const l = s.input.listen;
+  const host = location.hostname || 'this-server';
+  return l.protocol === 'srt' ? `srt://${host}:${l.port}` : `rtmp://${host}:${l.port}/live/${l.key}`;
+}
+
 function alertFor(s) {
   const rt = s.runtime, st = statusOf(s);
+  if (rt.status === 'waiting') return { kind: 'info', title: 'Waiting for the sender to connect', hint: `Send the stream to ${pushAddress(s)}` };
   if (st === 'stalled') return { kind: 'warn', title: 'No data from the source', hint: 'The connection is open but nothing has arrived for a few seconds.' };
   if (['restarting', 'error', 'starting'].includes(rt.status) && rt.lastError) {
     const e = explain(rt.lastError);
@@ -96,7 +106,7 @@ function alertFor(s) {
 function paintAlert(el, a) {
   el.hidden = !a;
   if (!a) return;
-  el.className = `alert ${a.kind === 'bad' ? 'bad' : ''}`;
+  el.className = `alert ${a.kind === 'bad' ? 'bad' : a.kind === 'info' ? 'info' : ''}`;
   el.innerHTML = `<b>${esc(a.title)}</b>${esc(a.hint)}`;
 }
 
@@ -214,25 +224,33 @@ function makeCard(id) {
         <div><b data-k="fps">-</b><span>Frames/s</span></div>
         <div><b data-k="up">-</b><span>Running for</span></div>
       </div>
+      <div class="outs" hidden></div>
     </div>
     <div class="actions">
       <button class="btn primary" data-a="toggle">Start</button>
+      <button class="btn" data-a="watch">Watch</button>
       <button class="btn" data-a="detail">Details</button>
       <span class="sp"></span>
       <button class="btn" data-a="edit">Edit</button>
     </div>`;
   el.addEventListener('click', async (e) => {
+    const sw = e.target.closest('[data-act]');
+    if (sw) {
+      try { await api('POST', `/api/streams/${id}/workers/${encodeURIComponent(sw.dataset.w)}/${sw.dataset.act}`); } catch (err) { alert(err.message); }
+      return;
+    }
     const a = e.target.closest('[data-a]')?.dataset.a;
     const s = streams.get(id);
     if (!a || !s) return;
     try {
       if (a === 'toggle') await api('POST', `/api/streams/${id}/${isActive(s) ? 'stop' : 'start'}`);
+      else if (a === 'watch') openWatch(id);
       else if (a === 'detail') openDetail(id);
       else if (a === 'edit') openEdit(s);
     } catch (err) { alert(err.message); }
   });
   $('#grid').appendChild(el);
-  const c = { el, video: $('video', el), hls: null, key: '' };
+  const c = { el, video: $('video', el), hls: null, key: '', outs: new Map() };
   // Hide the "preparing" text as soon as frames are available, without waiting for the next refresh.
   c.video.addEventListener('loadeddata', () => { $('.ph', el).hidden = true; });
   c.video.addEventListener('playing', () => { $('.ph', el).hidden = true; });
@@ -254,26 +272,108 @@ function syncPreview(c, s) {
   ph.hidden = !!want && c.video.readyState >= 2;
   ph.textContent = !s.preview ? 'Preview is turned off for this stream'
     : s.runtime.status === 'running' ? 'Preparing preview...'
-      : isActive(s) ? 'Connecting to the source...' : 'Stream is stopped';
+      : s.runtime.status === 'waiting' ? 'Waiting for the sender to connect...'
+        : isActive(s) ? 'Connecting to the source...' : 'Stream is stopped';
+}
+
+// Plays a live HLS playlist in a <video>. Returns the hls.js instance (or null when the browser plays HLS natively).
+function startHls(video, src) {
+  if (!(window.Hls && Hls.isSupported())) { video.src = src; return null; }
+  const hls = new Hls({
+    liveSyncDurationCount: 2, manifestLoadingMaxRetry: 60, manifestLoadingRetryDelay: 1000,
+    manifestLoadingMaxRetryTimeout: 2000, levelLoadingMaxRetry: 20,
+  });
+  hls.loadSource(src);
+  hls.attachMedia(video);
+  hls.on(Hls.Events.ERROR, (_e, d) => {
+    if (!d.fatal) return;
+    if (d.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
+    else if (d.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+  });
+  return hls;
 }
 
 function attachHls(c, src) {
-  if (window.Hls && Hls.isSupported()) {
-    c.hls = new Hls({
-      liveSyncDurationCount: 2, manifestLoadingMaxRetry: 60, manifestLoadingRetryDelay: 1000,
-      manifestLoadingMaxRetryTimeout: 2000, levelLoadingMaxRetry: 20,
-    });
-    c.hls.loadSource(src);
-    c.hls.attachMedia(c.video);
-    c.hls.on(Hls.Events.ERROR, (_e, d) => {
-      if (!d.fatal) return;
-      if (d.type === Hls.ErrorTypes.NETWORK_ERROR) c.hls.startLoad();
-      else if (d.type === Hls.ErrorTypes.MEDIA_ERROR) c.hls.recoverMediaError();
-    });
-    c.video.onplaying = () => { $('.ph', c.el).hidden = true; };
-  } else {
-    c.video.src = src;
+  c.hls = startHls(c.video, src);
+  c.video.onplaying = () => { $('.ph', c.el).hidden = true; };
+}
+
+/* ---- big player ---- */
+const watch = { id: null, key: '', hls: null };
+
+function openWatch(id) {
+  const s = streams.get(id);
+  if (!s) return;
+  watch.id = id;
+  $('#wName').textContent = s.name;
+  if (!$('#watchDlg').open) $('#watchDlg').showModal();
+  playWatch(s);
+}
+
+function playWatch(s) {
+  watch.hls?.destroy();
+  watch.key = `${s.id}:${s.runtime.startedAt}`;
+  const v = $('#wVideo');
+  v.removeAttribute('src');
+  v.load();
+  const live = s.runtime.status === 'running' && s.preview;
+  $('#wNote').textContent = !s.preview ? 'The live preview is turned off for this stream. Turn it on under Edit, step 3.'
+    : live ? '' : 'Waiting for the stream to start...';
+  watch.hls = live ? startHls(v, `/hls/${s.id}/index.m3u8`) : null;
+}
+
+$('#wClose').addEventListener('click', () => $('#watchDlg').close());
+$('#watchDlg').addEventListener('close', () => {
+  watch.hls?.destroy();
+  watch.hls = null;
+  watch.id = null;
+  const v = $('#wVideo');
+  v.removeAttribute('src');
+  v.load();
+});
+
+/* ---- keyed lists: update rows in place so a button is never replaced under the mouse ---- */
+function syncKeyed(box, map, items, create, update) {
+  const keep = new Set();
+  for (const it of items) {
+    keep.add(it.id);
+    let e = map.get(it.id);
+    if (!e) { e = create(it); map.set(it.id, e); box.appendChild(e.el); }
+    update(e, it);
   }
+  for (const [id, e] of map) if (!keep.has(id)) { e.el.remove(); map.delete(id); }
+}
+
+const PRESET_TAG = { original: 'pass through', audio_fix: 'fix audio', hd720: '720p', hd1080: '1080p' };
+const wState = (w) => (w.status === 'running' ? 'ok' : ['starting', 'restarting', 'waiting', 'stopping'].includes(w.status) ? 'wait' : w.status === 'error' ? 'bad' : '');
+const wLabel = (w) => (w.kind === 'dest' ? describe(w.url) : w.kind === 'record' ? 'Recording' : w.kind === 'preview' ? 'Live preview' : 'Source');
+const wProblem = (w) => (w.lastError && w.status !== 'running' && w.status !== 'stopped' && w.status !== 'stopping'
+  ? (explain(w.lastError)?.title || 'Problem - see Details > Outputs') : '');
+
+function makeOutLine() {
+  const el = document.createElement('div');
+  el.innerHTML = `<div class="out-line"><i class="dot"></i><span class="nm"></span><span class="rate"></span><button type="button" class="mini"></button></div><div class="out-err" hidden></div>`;
+  return { el, dot: $('.dot', el), nm: $('.nm', el), rate: $('.rate', el), btn: $('.mini', el), err: $('.out-err', el) };
+}
+
+function paintOuts(c, s) {
+  const box = $('.outs', c.el);
+  const rows = s.runtime.workers.filter((w) => w.kind !== 'ingest');
+  box.hidden = !rows.length;
+  syncKeyed(box, c.outs, rows, makeOutLine, (e, w) => {
+    e.dot.className = `dot ${wState(w)}`;
+    const tag = w.kind === 'dest' && w.preset && w.preset !== 'inherit' ? `<i>${esc(PRESET_TAG[w.preset] || '')}</i>` : '';
+    e.nm.innerHTML = `${esc(wLabel(w))}${tag}`;
+    e.rate.textContent = w.status === 'running' && w.kind !== 'preview' ? fmtBitrate(w.stats.bitrate) : '';
+    // Switches only make sense while the stream itself is running.
+    e.btn.hidden = !isActive(s);
+    e.btn.textContent = w.desired ? 'Stop' : 'Start';
+    e.btn.dataset.act = w.desired ? 'stop' : 'start';
+    e.btn.dataset.w = w.id;
+    const problem = wProblem(w);
+    e.err.hidden = !problem;
+    e.err.textContent = problem;
+  });
 }
 
 function formatLine(info) {
@@ -299,7 +399,8 @@ function render() {
     pill.textContent = STATUS_TEXT[st] || st;
     pill.className = `pill ${st}`;
     $('.rec', el).hidden = !(s.record?.enabled && rt.status === 'running');
-    $('.fmt', el).textContent = rt.status === 'stopped' ? '' : formatLine(rt.info);
+    $('[data-a=watch]', el).hidden = !(s.preview && rt.status === 'running');
+    $('.fmt', el).textContent = ['stopped', 'waiting'].includes(rt.status) ? '' : formatLine(rt.info);
     paintAlert($('.alert', el), alertFor(s));
     const live2 = rt.status === 'running';
     $('[data-k=inbitrate]', el).textContent = live2 ? fmtBitrate(rt.stats.inBitrate) : '-';
@@ -310,8 +411,14 @@ function render() {
     btn.textContent = isActive(s) ? 'Stop' : 'Start';
     btn.className = `btn ${isActive(s) ? 'stop' : 'primary'}`;
     syncPreview(c, s);
+    paintOuts(c, s);
   }
   if (detailId) renderDetail();
+  if (watch.id) {
+    const w = streams.get(watch.id);
+    if (!w) $('#watchDlg').close();
+    else if (`${w.id}:${w.runtime.startedAt}` !== watch.key) playWatch(w);   // stream (re)started: reload the player
+  }
 }
 
 /* ================= details ================= */
@@ -347,9 +454,104 @@ $('#repRefresh').addEventListener('click', loadReport);
 function paintLog() {
   const pre = $('#dLog');
   const stick = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 20;
-  pre.textContent = logBuf.join('\n');
+  const f = $('#logFilter').value;
+  pre.textContent = (f ? logBuf.filter((l) => l.includes(`[${f}]`)) : logBuf).join('\n');
   if (stick) pre.scrollTop = pre.scrollHeight;
 }
+$('#logFilter').addEventListener('change', () => { paintLog(); $('#dLog').scrollTop = 1e9; });
+
+// The log shows every part of the stream; the filter lists the parts that exist right now.
+function syncLogFilter(s) {
+  const sel = $('#logFilter');
+  const labels = s.runtime.workers.map((w) => w.label);
+  const sig = labels.join('|');
+  if (sel.dataset.sig === sig) return;
+  sel.dataset.sig = sig;
+  const keep = sel.value;
+  sel.innerHTML = '<option value="">Everything</option>' + labels.map((l) => `<option value="${esc(l)}">${esc(l === 'source' ? 'Source' : l)}</option>`).join('');
+  sel.value = labels.includes(keep) ? keep : '';
+}
+
+/* ---- Outputs tab: one card per part of the stream ---- */
+const outCards = new Map();
+
+function makeOutCard() {
+  const el = document.createElement('div');
+  el.className = 'out-card';
+  el.innerHTML = `
+    <div><h5><span class="t"></span><span class="pill"></span></h5><div class="sub"></div></div>
+    <div class="btns"><button type="button" class="btn sm" data-act="toggle"></button><button type="button" class="btn sm" data-act="restart">Restart</button></div>
+    <div class="nums"></div>
+    <div class="msg bad" hidden></div>`;
+  return { el, t: $('.t', el), pill: $('.pill', el), sub: $('.sub', el), nums: $('.nums', el), msg: $('.msg', el), toggle: $('[data-act=toggle]', el), restart: $('[data-act=restart]', el) };
+}
+
+function outputSubtitle(s, w) {
+  if (w.kind === 'ingest') {
+    const fb = s.runtime.fallback || {};
+    const note = [fb.audio ? 'audio converted to AAC' : '', fb.video ? 'video converted to H.264' : ''].filter(Boolean).join(', ');
+    return `${sourceText(s)}${note ? ` (${note} so every output can use it)` : ''}`;
+  }
+  if (w.kind === 'dest') return `${mask(w.url)} - ${w.preset && w.preset !== 'inherit' ? `own conversion: ${PRESET_TAG[w.preset]}` : 'conversion as set for the stream'}`;
+  if (w.kind === 'record') return `Saved as ${s.record.format.toUpperCase()}${s.record.splitMinutes ? `, a new file every ${s.record.splitMinutes} minutes` : ''}`;
+  return `Browser preview, ${{ low: 'low quality (360p)', hd: 'HD (720p)', copy: 'original quality' }[s.previewQuality]}`;
+}
+
+function renderOutputs(s) {
+  const active = isActive(s);
+  const label = (w) => (w.kind === 'ingest' ? 'Source' : wLabel(w));
+  syncKeyed($('#outList'), outCards, s.runtime.workers, makeOutCard, (e, w) => {
+    const ingest = w.kind === 'ingest';
+    e.t.textContent = label(w);
+    e.pill.textContent = STATUS_TEXT[w.stalled ? 'stalled' : w.status] || w.status;
+    e.pill.className = `pill ${w.stalled ? 'stalled' : w.status}`;
+    e.sub.textContent = outputSubtitle(s, w);
+    const live = w.status === 'running';
+    const n = (k, v) => `<span>${k} <b>${v}</b></span>`;
+    e.nums.innerHTML = [
+      n('Bitrate', live && w.kind !== 'preview' ? fmtBitrate(w.stats.bitrate) : '-'),
+      n('Frame rate', live ? `${w.stats.fps.toFixed(1)} fps` : '-'),
+      n('Speed', live ? `${w.stats.speed.toFixed(2)}x` : '-'),
+      n('Running for', w.uptime ? fmtUp(w.uptime) : '-'),
+      n('Restarts', String(w.restarts)),
+      n('Data', fmtBytes(w.stats.size)),
+    ].join('');
+    e.toggle.hidden = ingest || !active;
+    e.toggle.textContent = w.desired ? 'Stop' : 'Start';
+    e.toggle.dataset.act = w.desired ? 'stop' : 'start';
+    e.toggle.dataset.w = w.id;
+    e.restart.hidden = !active || (!ingest && !w.desired);
+    e.restart.dataset.w = w.id;
+    e.restart.textContent = ingest ? 'Restart source' : 'Restart';
+    const problem = wProblem(w);
+    const raw = w.lastError ? ` (${w.lastError.replace(/^\[[^\]]*\]\s*/, '').slice(0, 140)})` : '';
+    e.msg.hidden = !problem;
+    e.msg.textContent = problem ? `${problem}${raw}` : '';
+  });
+}
+
+$('#outList').addEventListener('click', async (e) => {
+  const b = e.target.closest('button[data-act]');
+  if (!b || !detailId) return;
+  const act = b.dataset.act === 'toggle' ? 'start' : b.dataset.act;
+  try { await api('POST', `/api/streams/${detailId}/workers/${encodeURIComponent(b.dataset.w)}/${act}`); } catch (err) { alert(err.message); }
+});
+
+async function takeSnapshot(id, msg) {
+  msg.textContent = 'Capturing...';
+  try {
+    const res = await fetch(`/api/streams/${id}/snapshot.jpg`);
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(await res.blob());
+    a.download = `snapshot-${(streams.get(id)?.name || 'stream').replace(/[^\w.-]+/g, '_')}-${Date.now()}.jpg`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    msg.textContent = 'Snapshot saved to your downloads.';
+  } catch (err) { msg.textContent = err.message; }
+}
+$('#snapBtn').addEventListener('click', () => takeSnapshot(detailId, $('#snapMsg')));
+$('#wSnap').addEventListener('click', () => takeSnapshot(watch.id, $('#wNote')));
 
 function renderFormatTable(s) {
   const info = s.runtime.info;
@@ -357,12 +559,12 @@ function renderFormatTable(s) {
   // Sources often do not declare a bitrate, so fall back to what the server actually measures.
   const inText = info.bitrate ? kbps(info.bitrate) : live && st.inBitrate ? `${fmtBitrate(st.inBitrate)} (measured)` : '';
   const cols = [{ title: 'Input', sub: sourceText(s), format: info.format, bitrateText: inText, video: info.video, audio: info.audio }];
-  // ffmpeg's size counter follows its first output, which is the first destination (or recording/preview if none).
+  // Every destination runs in its own process, so each one has its own measured bitrate.
   const visible = info.outputs.filter((o) => o.kind !== 'tap');
   let destNo = 1;
-  visible.forEach((o, i) => {
-    const t = !live || !st.bitrate || o.kind === 'preview' ? ''
-      : i === 0 ? `${fmtBitrate(st.bitrate)} (measured)` : `about ${fmtBitrate(st.bitrate)} (same settings)`;
+  visible.forEach((o) => {
+    const w = s.runtime.workers.find((x) => x.id === o.id);
+    const t = w && w.status === 'running' && w.stats.bitrate && o.kind !== 'preview' ? `${fmtBitrate(w.stats.bitrate)} (measured)` : '';
     const title = o.kind === 'record' ? 'Recording' : o.kind === 'preview' ? 'Live preview' : `Destination ${destNo++}`;
     const sub = o.kind === 'dest' ? mask(o.url) : o.kind === 'preview' ? 'low resolution, for the dashboard' : o.url.split('/').pop();
     cols.push({ title, sub, format: o.format, bitrateText: t, video: o.video, audio: o.audio });
@@ -399,7 +601,9 @@ function renderDetail() {
   sb.textContent = STATUS_TEXT[statusOf(s)];
   sb.className = `pill ${statusOf(s)}`;
   $('#dCmd').textContent = rt.command || '(not started yet)';
+  syncLogFilter(s);
   if (tab === 'fmt') renderFormatTable(s);
+  if (tab === 'out') renderOutputs(s);
   if (tab !== 'ov') return;
 
   paintAlert($('#dAlert'), alertFor(s));
@@ -461,7 +665,7 @@ $('#recList').addEventListener('click', async (e) => {
 });
 $$('.tabs button').forEach((b) => b.addEventListener('click', () => selectTab(b.dataset.tab)));
 $('#dClose').addEventListener('click', () => $('#detailDlg').close());
-$('#detailDlg').addEventListener('close', () => { detailId = null; clearInterval(recTimer); });
+$('#detailDlg').addEventListener('close', () => { detailId = null; clearInterval(recTimer); outCards.clear(); $('#outList').innerHTML = ''; });
 
 /* ================= create / edit ================= */
 const form = $('#form');
@@ -579,18 +783,80 @@ $('#srcType').addEventListener('change', () => {
   updateVisibility();
 });
 
+// The address a camera or encoder must send to, shown while the user sets up a listener.
+function updatePushUrl() {
+  const f = form.elements;
+  const srt = f['input.listen.protocol'].value === 'srt';
+  const port = f['input.listen.port'].value || (srt ? '9000' : '1935');
+  const host = location.hostname || 'this-server';
+  $('#pushUrl').textContent = srt ? `srt://${host}:${port}` : `rtmp://${host}:${port}/live/${f['input.listen.key'].value || 'stream'}`;
+}
+
+/* ---- logo images ---- */
+let logoFiles = [];
+let logoSel = '';
+
+async function loadLogos() {
+  try { logoFiles = (await api('GET', '/api/logos')).files; } catch { logoFiles = []; }
+  renderLogos();
+}
+
+function renderLogos() {
+  if (logoSel && !logoFiles.some((f) => f.name === logoSel)) logoSel = '';
+  $('#logoList').innerHTML = logoFiles.length ? logoFiles.map((f) => `
+    <div class="logo-row">
+      <label><input type="radio" name="_logo" value="${esc(f.name)}" ${f.name === logoSel ? 'checked' : ''}>
+        <img src="/api/logos/${encodeURIComponent(f.name)}" alt=""><span>${esc(f.name)}</span></label>
+      <button type="button" class="btn sm danger-text" data-ldel="${esc(f.name)}">Delete</button>
+    </div>`).join('') : '<p class="note">No logos uploaded yet. Use PNG for a transparent background.</p>';
+  form.elements['picture.logo.file'].value = logoSel;
+}
+
+$('#logoList').addEventListener('change', (e) => {
+  if (e.target.name !== '_logo') return;
+  logoSel = e.target.value;
+  form.elements['picture.logo.file'].value = logoSel;
+});
+$('#logoList').addEventListener('click', async (e) => {
+  const name = e.target.dataset.ldel;
+  if (!name || !confirm(`Delete the logo "${name}"?`)) return;
+  try { await api('DELETE', `/api/logos/${encodeURIComponent(name)}`); await loadLogos(); } catch (err) { alert(err.message); }
+});
+$('#logoUpBtn').onclick = () => $('#logoFile').click();
+$('#logoFile').addEventListener('change', async (e) => {
+  const prog = $('#logoProg');
+  for (const file of [...e.target.files]) {
+    try {
+      const res = await fetch(`/api/logos/${encodeURIComponent(file.name)}`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: file });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error || `Upload failed (${res.status})`);
+      logoSel = body.name;
+      prog.textContent = `Uploaded ${body.name}`;
+    } catch (err) { prog.textContent = err.message; }
+  }
+  e.target.value = '';
+  await loadLogos();
+});
+
 function updateVisibility() {
   const p = proto(form.elements['input.url'].value);
   $$('[data-for=rtsp]').forEach((e) => (e.hidden = !/^rtsps?$/.test(p)));
   $$('[data-for=rtp]').forEach((e) => (e.hidden = p !== 'rtp'));
   const media = srcType() === 'media';
   $$('[data-src]').forEach((e) => (e.hidden = e.dataset.src !== srcType()));
-  $$('[data-for=loop]').forEach((e) => (e.hidden = !(media || p === 'file')));
+  $$('[data-for=loop]').forEach((e) => (e.hidden = !(media || (srcType() === 'url' && p === 'file'))));
+  const lp = form.elements['input.listen.protocol'].value;
+  $$('[data-for=rtmpkey]').forEach((e) => (e.hidden = lp !== 'rtmp'));
+  $$('[data-for=srtpass]').forEach((e) => (e.hidden = lp !== 'srt'));
+  updatePushUrl();
+  $('#txtOpts').hidden = !form.elements['picture.text.enabled'].checked;
+  $('#logoOpts').hidden = !form.elements['picture.logo.enabled'].checked;
   $$('[data-for=auth]').forEach((e) => (e.hidden = ['file', 'udp', 'rtp'].includes(p)));
   $$('[data-for=vtx]').forEach((e) => (e.hidden = form.elements['video.mode'].value !== 'transcode'));
   $$('[data-for=atx]').forEach((e) => (e.hidden = form.elements['audio.mode'].value !== 'transcode'));
   $('#customConv').hidden = chosenPreset() !== 'custom';
   $('#recOpts').hidden = !$('#recOn').checked;
+  $('#prevOpts').hidden = !form.elements.preview.checked;
 }
 form.addEventListener('input', updateVisibility);
 form.addEventListener('change', updateVisibility);
@@ -607,6 +873,7 @@ function addDest(o = { url: '', enabled: true }) {
   if (!o.url) d.type = 'udp';   // the most common destination, so a new row starts as UDP
   const row = document.createElement('div');
   row.className = 'dest';
+  row.dataset.id = o.id || '';   // keeps the destination's identity (and running state) when the stream is edited
   row.innerHTML = `
     <select class="d-type">
       <option value="udp">UDP</option><option value="rtp">RTP</option>
@@ -616,7 +883,16 @@ function addDest(o = { url: '', enabled: true }) {
     <input class="d-port" type="number" min="1" max="65535" placeholder="Port">
     <input class="d-url" placeholder="srt://host:9000   rtmp://server/live/key   C:\\video\\out.mp4" autocomplete="off">
     <label class="on"><input type="checkbox" class="d-on"> On</label>
-    <button type="button" class="btn sm danger-text">Remove</button>`;
+    <button type="button" class="btn sm danger-text" data-rm>Remove</button>
+    <div class="d-conv"><span>Conversion for this destination:</span>
+      <select class="d-preset">
+        <option value="inherit">Same as the stream (step 2)</option>
+        <option value="original">Pass through unchanged</option>
+        <option value="audio_fix">Keep video, fix audio</option>
+        <option value="hd720">Convert to 720p</option>
+        <option value="hd1080">Convert to 1080p</option>
+      </select></div>`;
+  $('.d-preset', row).value = o.preset || 'inherit';
   $('.d-type', row).value = d.type;
   $('.d-host', row).value = d.host;
   $('.d-port', row).value = d.port;
@@ -628,7 +904,7 @@ function addDest(o = { url: '', enabled: true }) {
     $('.d-url', row).hidden = !other;
   };
   $('.d-type', row).addEventListener('change', sync);
-  $('button', row).onclick = () => row.remove();
+  $('[data-rm]', row).onclick = () => row.remove();
   sync();
   $('#dests').appendChild(row);
 }
@@ -638,15 +914,16 @@ function readDests() {
   const out = [];
   for (const row of $$('.dest')) {
     const type = $('.d-type', row).value, on = $('.d-on', row).checked;
+    const meta = { id: row.dataset.id || undefined, enabled: on, preset: $('.d-preset', row).value };
     if (type === 'url') {
       const url = $('.d-url', row).value.trim();
-      if (url) out.push({ url, enabled: on });
+      if (url) out.push({ ...meta, url });
       continue;
     }
     const host = $('.d-host', row).value.trim(), port = $('.d-port', row).value.trim();
     if (!host && !port) continue;
     if (!host || !port) throw new Error(`A ${type.toUpperCase()} destination needs both an address and a port.`);
-    out.push({ url: `${type}://${host}:${port}`, enabled: on });
+    out.push({ ...meta, url: `${type}://${host}:${port}` });
   }
   return out;
 }
@@ -668,6 +945,10 @@ function showStep(n) {
 
 function validateStep1() {
   if (srcType() === 'media') return mediaSel.length ? '' : 'Pick at least one video, or upload one.';
+  if (srcType() === 'listen') {
+    const port = Number(form.elements['input.listen.port'].value);
+    return port >= 1 && port <= 65535 ? '' : 'Enter the port this server should listen on (1 to 65535).';
+  }
   const url = form.elements['input.url'].value.trim();
   if (!url) return 'Enter where the stream comes from.';
   if (proto(url) === 'rtp' && !form.elements['input.sdp'].value.trim()) return 'rtp:// sources need an SDP description.';
@@ -690,9 +971,20 @@ $('#newBtn').onclick = () => openEdit(null);
 $('#emptyBtn').onclick = () => openEdit(null);
 
 const DEFAULTS = {
-  name: '', input: { type: 'url', files: [], url: '', username: '', password: '', rtspTransport: 'tcp', sdp: '', loop: false, extra: '' },
-  video: BLANK.video, audio: BLANK.audio, outputs: [{ url: '', enabled: true }],
-  extraOutputArgs: '', preview: true, autoRestart: true, autoStart: false,
+  name: '',
+  input: {
+    type: 'url', files: [], url: '', username: '', password: '', rtspTransport: 'tcp', sdp: '', loop: false, extra: '',
+    listen: { protocol: 'rtmp', port: 1935, key: 'stream', passphrase: '' },
+  },
+  video: BLANK.video, audio: BLANK.audio,
+  picture: {
+    rotate: 0, flipH: false, flipV: false, deinterlace: false, crop: { left: '', right: '', top: '', bottom: '' },
+    text: { enabled: false, content: '', clock: false, position: 'top-left', size: 'medium', color: 'white', box: true },
+    logo: { enabled: false, file: '', position: 'top-right', sizePercent: 12, opacity: 100 },
+  },
+  audioFx: { source: 'original', gainDb: '', normalize: false },
+  outputs: [{ url: '', enabled: true }],
+  extraOutputArgs: '', preview: true, previewQuality: 'low', autoRestart: true, autoStart: false,
   record: { enabled: false, format: 'mkv', splitMinutes: 0 },
 };
 
@@ -707,6 +999,14 @@ function openEdit(s) {
   setFields(d);
   if (!s) applyPreset('audio_fix');
   $('#inPass').placeholder = d.input.passwordSet ? 'saved - leave empty to keep' : '';
+  $('#lisPass').placeholder = d.input.listen?.passphraseSet ? 'saved - leave empty to keep' : '';
+  logoSel = d.picture?.logo?.file || '';
+  $('#logoProg').textContent = '';
+  loadLogos();
+  const fx = d.picture, sfx = d.audioFx;
+  // Open the adjustments section when something in it is switched on, so nothing active is hidden from view.
+  $('#fxBox').open = !!(fx && (fx.rotate || fx.flipH || fx.flipV || fx.deinterlace || fx.text.enabled || fx.logo.enabled
+    || Object.values(fx.crop || {}).some(Boolean)) || (sfx && (sfx.source === 'silence' || sfx.gainDb || sfx.normalize)));
   $$('input[name=_src]').forEach((r) => (r.checked = r.value === (d.input.type || 'url')));
   mediaSel = [...(d.input.files || [])];
   $('#mediaProg').textContent = '';
@@ -730,7 +1030,7 @@ function readForm() {
   body.outputs = readDests();
   body.input.type = srcType();
   body.input.files = srcType() === 'media' ? [...mediaSel] : [];
-  if (srcType() === 'media') body.input.url = '';
+  if (srcType() !== 'url') body.input.url = '';
   return body;
 }
 
@@ -741,6 +1041,11 @@ form.addEventListener('submit', async (e) => {
     const err = validateStep1();
     if (err) { showStep(1); return showErr(err); }
     const body = readForm();
+    if (body.picture.logo.enabled && !body.picture.logo.file) {
+      showStep(2);
+      $('#fxBox').open = true;
+      return showErr('Pick a logo image, or untick "Add a logo image".');
+    }
     if (editId) await api('PUT', `/api/streams/${editId}`, body);
     else await api('POST', '/api/streams', body);
     $('#editDlg').close();
@@ -812,7 +1117,7 @@ function connect() {
     m.streams.forEach((s) => streams.set(s.id, s));
     if (detailId && m.logs[detailId]) {
       logBuf.push(...m.logs[detailId]);
-      if (logBuf.length > 500) logBuf = logBuf.slice(-500);
+      if (logBuf.length > 1500) logBuf = logBuf.slice(-1500);
       if (!$('#dLog').closest('section').hidden) paintLog();
     }
     render();

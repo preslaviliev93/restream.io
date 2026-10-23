@@ -3,6 +3,7 @@
 const os = require('os');
 const { maskSecrets } = require('./ffmpeg');
 
+const PRESET_NAMES = { inherit: 'Same as stream', original: 'Pass through', audio_fix: 'Keep video, fix audio', hd720: '720p', hd1080: '1080p' };
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 /* ---------- formatting ---------- */
@@ -58,13 +59,14 @@ function build(runner, sys) {
     fps: describe(series.map((x) => x.f)),
     speed: describe(series.map((x) => x.s)),
   };
+  const cur = runner.currentTotals();
   const totals = {
-    bytesIn: rep.base.bytesIn + (active ? runner.inBytes : 0),
-    bytesOut: rep.base.bytesOut + (active ? st.size : 0),
-    frames: rep.base.frames + (active ? st.frame : 0),
-    drops: rep.base.drops + (active ? st.drop : 0),
-    dups: rep.base.dups + (active ? st.dup : 0),
-    mediaSeconds: rep.base.media + (active ? st.outTime : 0),
+    bytesIn: runner.inBytes,
+    bytesOut: rep.base.bytesOut + cur.bytesOut,
+    frames: rep.base.frames + cur.frames,
+    drops: rep.base.drops + cur.drops,
+    dups: rep.base.dups + cur.dups,
+    mediaSeconds: rep.base.media + cur.media,
   };
   const reconnects = rep.events.filter((e) => e.state === 'down' && /lost/i.test(e.text)).length;
   const availability = durationMs > 0 ? Math.min(100, (rep.runningMs / durationMs) * 100) : 0;
@@ -100,6 +102,7 @@ function build(runner, sys) {
     status: runner.status,
     session: { startedAt: rep.startedAt, endedAt: end, durationMs, runningMs: rep.runningMs, availability, reconnects, stalls: rep.stalls, warnings: rep.warnings, errors: rep.errors },
     health: { score, label, parts },
+    destinations: runner.destinationReport(durationMs),
     metrics, totals, slowShare, dropPct, timeline, messages,
     events: rep.events,
     format: { format: info.format, bitrate: info.bitrate, video: info.video, audio: info.audio, outputs: info.outputs.filter((o) => o.kind !== 'tap').map((o) => ({ ...o, url: maskSecrets(o.url) })) },
@@ -139,6 +142,10 @@ function summarize(r) {
   }
   points.push(t.drops ? `${t.drops} frame${t.drops === 1 ? ' was' : 's were'} dropped (${r.dropPct.toFixed(2)}%).` : 'No frames were dropped.');
   points.push(`${fmtBytes(t.bytesOut)} was sent out in total (${fmtBytes(t.bytesIn)} received).`);
+  for (const d of r.destinations.filter((x) => x.kind === 'dest')) {
+    if (d.restarts) points.push(`${d.label} (${d.url}) restarted ${d.restarts} time${d.restarts === 1 ? '' : 's'}.`);
+    else if (d.status === 'error') points.push(`${d.label} (${d.url}) is stopped because of an error.`);
+  }
 
   if (r.slowShare >= 0.05) tips.push('The server is struggling to convert in real time. Use "Keep video, fix audio" (no video re-encoding), a lower resolution, or a faster encoder preset.');
   if (s.reconnects >= 2 || s.stalls >= 2) tips.push('The source is unstable. For RTSP cameras make sure the transport is TCP (under More source options) and check the network or Wi-Fi to the camera.');
@@ -278,6 +285,19 @@ ${lineChart({ title: 'Processing speed', series: [{ name: 'Speed (1.0 = real tim
 ${histogram(r.series.map((p) => p.o), fmtRate)}
 
 <h2>Technical details</h2>
+<details open><summary>Destinations (${r.destinations.length})</summary>
+${r.destinations.length ? table(['Output', 'Settings', 'State', 'Avg bitrate', 'Peak', 'Avg fps', 'Delivered', 'Restarts', 'Errors'], r.destinations.map((d) => [
+    esc(d.kind === 'dest' ? `${d.label}<br><span class="sub">${d.url}</span>` : d.label),
+    esc(PRESET_NAMES[d.preset] || 'Same as stream'),
+    esc(d.status),
+    d.avgBitrate ? fmtRate(d.avgBitrate) : '-',
+    d.maxBitrate ? fmtRate(d.maxBitrate) : '-',
+    d.avgFps ? n1(d.avgFps) : '-',
+    s.durationMs ? `${Math.min(100, (d.runningMs / s.durationMs) * 100).toFixed(1)}%` : '-',
+    String(d.restarts),
+    String(d.errors),
+  ]), ['', '', '', 'num', 'num', 'num', 'num', 'num', 'num']) : '<p class="dim">No destinations.</p>'}</details>
+
 <details open><summary>Statistics per metric (${m.outBitrate?.n || 0} samples, one every ${r.sampleSpacingSec} s)</summary>
 ${table(['Metric', 'Samples', 'Min', 'Average', 'Median', '95th pct', '99th pct', 'Max', 'Std dev', 'Variation'], [
     stat('Input bitrate', m.inBitrate, fmtRate), stat('Output bitrate', m.outBitrate, fmtRate),
@@ -288,7 +308,7 @@ ${table(['Metric', 'Samples', 'Min', 'Average', 'Median', '95th pct', '99th pct'
 <details open><summary>Totals for this session</summary>
 ${table(['Item', 'Value'], [
     ['Data received (measured at input)', fmtBytes(t.bytesIn)],
-    ['Data sent (first destination)', fmtBytes(t.bytesOut)],
+    ['Data sent (all destinations together)', fmtBytes(t.bytesOut)],
     ['Output / input size ratio', t.bytesIn ? (t.bytesOut / t.bytesIn).toFixed(2) : '-'],
     ['Frames processed', String(t.frames)],
     ['Dropped / duplicated frames', `${t.drops} / ${t.dups} (${r.dropPct.toFixed(3)}% dropped)`],

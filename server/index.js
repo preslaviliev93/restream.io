@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const { WebSocketServer } = require('ws');
 const report = require('./report');
-const { Manager, systemInfo, detectEncoders, hlsStore, MEDIA_DIR, MEDIA_EXT } = require('./manager');
+const { Manager, systemInfo, detectEncoders, hlsStore, relay, MEDIA_DIR, MEDIA_EXT, LOGO_DIR, LOGO_EXT } = require('./manager');
 
 const PORT = Number(process.env.PORT) || 3000;
 // Local tool that can spawn processes and read files: bind to loopback unless told otherwise.
@@ -27,6 +27,7 @@ function authorized(header) {
 
 // ffmpeg reaches the server over loopback, so the connect address must be loopback unless bound to one interface.
 hlsStore.ingestBase = `http://${['0.0.0.0', '::', ''].includes(HOST) ? '127.0.0.1' : HOST}:${PORT}`;
+relay.base = hlsStore.ingestBase;
 
 const manager = new Manager();
 const app = express();
@@ -50,13 +51,16 @@ app.put('/ingest/:token/:id/:name', (req, res) => {
   });
 });
 
-// Input-bitrate tap from ffmpeg: bytes are only counted, never stored.
-app.put('/tap/:token/:id', (req, res) => {
-  const runner = manager.runners.get(req.params.id);
-  if (req.params.token !== hlsStore.token || !runner) return res.status(403).end();
-  req.on('data', (c) => { runner.inBytes += c.length; });
-  req.on('end', () => res.status(201).end());
-});
+// Internal relay between the source ffmpeg and the processes that read it (destinations, recording, preview,
+// snapshots). Token-guarded and only reachable from this machine, so it is not part of the login.
+const internal = (req, res) => {
+  const ok = req.params.token === relay.token && manager.runners.has(req.params.id)
+    && req.socket.localAddress === req.socket.remoteAddress;
+  if (!ok) res.status(403).end();
+  return ok;
+};
+app.put('/relay/:token/:id', (req, res) => { if (internal(req, res)) relay.ingest(req.params.id, req, res); });
+app.get('/relay/:token/:id', (req, res) => { if (internal(req, res)) relay.subscribe(req.params.id, req, res); });
 
 app.use((req, res, next) => {
   if (authorized(req.headers.authorization)) return next();
@@ -74,6 +78,14 @@ app.post('/api/streams', wrap(async (req, res) => res.status(201).json(await man
 app.put('/api/streams/:id', wrap(async (req, res) => res.json(await manager.update(req.params.id, req.body))));
 app.delete('/api/streams/:id', wrap(async (req, res) => { await manager.remove(req.params.id); res.status(204).end(); }));
 app.post('/api/streams/:id/start', wrap((req, res) => { manager.get(req.params.id).start(); res.json({ ok: true }); }));
+// Start, stop or restart one part of a running stream: the source, a destination, the recording or the preview.
+app.post('/api/streams/:id/workers/:wid/:action', wrap(async (req, res) => { await manager.control(req.params.id, req.params.wid, req.params.action); res.json({ ok: true }); }));
+app.get('/api/streams/:id/snapshot.jpg', wrap(async (req, res) => {
+  const jpg = await manager.get(req.params.id).snapshotJpeg();
+  res.set({ 'Content-Type': 'image/jpeg', 'Cache-Control': 'no-store' });
+  if (req.query.download === '1') res.set('Content-Disposition', `attachment; filename="snapshot-${Date.now()}.jpg"`);
+  res.send(jpg);
+}));
 app.post('/api/streams/:id/stop', wrap(async (req, res) => { await manager.get(req.params.id).stop(); res.json({ ok: true }); }));
 app.get('/api/streams/:id/logs', wrap((req, res) => res.json(manager.get(req.params.id).logs)));
 app.get('/api/streams/:id/recordings', wrap((req, res) => res.json(manager.recordings(req.params.id))));
@@ -97,25 +109,37 @@ app.get('/api/streams/:id/report.csv', wrap((req, res) => {
 app.get('/api/media', wrap((_req, res) => res.json(manager.mediaList())));
 app.delete('/api/media/:name', wrap((req, res) => { manager.mediaDelete(req.params.name); res.status(204).end(); }));
 // Raw upload: the request body is the file. Written to a .part file first so a broken upload leaves nothing behind.
-app.post('/api/media/:name', (req, res) => {
-  const safe = path.basename(req.params.name).replace(/[^\w .()\-]+/g, '_');
-  if (!MEDIA_EXT.test(safe)) return res.status(400).json({ error: 'Unsupported file type. Use mp4, mkv, mov, avi, ts, webm, m4v, flv, mpg or wmv.' });
-  const ext = path.extname(safe);
-  let name = safe, n = 1;
-  while (fs.existsSync(path.join(MEDIA_DIR, name))) name = `${path.basename(safe, ext)}-${n++}${ext}`;
-  const final = path.join(MEDIA_DIR, name);
-  const tmp = `${final}.part`;
-  const out = fs.createWriteStream(tmp);
-  const fail = (msg) => { out.destroy(); fs.rmSync(tmp, { force: true }); if (!res.headersSent) res.status(500).json({ error: msg }); };
-  req.on('aborted', () => fail('Upload cancelled'));
-  req.on('error', () => fail('Upload failed'));
-  out.on('error', (e) => fail(e.message));
-  out.on('finish', () => {
-    fs.renameSync(tmp, final);
-    res.status(201).json({ name, size: fs.statSync(final).size });
-  });
-  req.pipe(out);
-});
+function receiveUpload(dir, extRe, allowed) {
+  return (req, res) => {
+    const safe = path.basename(req.params.name).replace(/[^\w .()-]+/g, '_');
+    if (!extRe.test(safe)) return res.status(400).json({ error: `Unsupported file type. Use ${allowed}.` });
+    const ext = path.extname(safe);
+    let name = safe, n = 1;
+    while (fs.existsSync(path.join(dir, name))) name = `${path.basename(safe, ext)}-${n++}${ext}`;
+    const final = path.join(dir, name);
+    const tmp = `${final}.part`;
+    const out = fs.createWriteStream(tmp);
+    const fail = (msg) => { out.destroy(); fs.rmSync(tmp, { force: true }); if (!res.headersSent) res.status(500).json({ error: msg }); };
+    req.on('aborted', () => fail('Upload cancelled'));
+    req.on('error', () => fail('Upload failed'));
+    out.on('error', (e) => fail(e.message));
+    out.on('finish', () => {
+      fs.renameSync(tmp, final);
+      res.status(201).json({ name, size: fs.statSync(final).size });
+    });
+    req.pipe(out);
+  };
+}
+app.post('/api/media/:name', receiveUpload(MEDIA_DIR, MEDIA_EXT, 'mp4, mkv, mov, avi, ts, webm, m4v, flv, mpg or wmv'));
+// Logo images for the picture overlay.
+app.get('/api/logos', wrap((_req, res) => res.json(manager.logoList())));
+app.get('/api/logos/:name', wrap((req, res) => {
+  const name = req.params.name;
+  if (path.basename(name) !== name || !LOGO_EXT.test(name)) throw new Error('Invalid logo name');
+  res.sendFile(path.join(LOGO_DIR, name), (err) => { if (err && !res.headersSent) res.status(404).json({ error: 'Logo not found' }); });
+}));
+app.post('/api/logos/:name', receiveUpload(LOGO_DIR, LOGO_EXT, 'png, jpg or webp'));
+app.delete('/api/logos/:name', wrap((req, res) => { manager.logoDelete(req.params.name); res.status(204).end(); }));
 app.post('/api/probe', wrap(async (req, res) => res.json(await manager.probeInput(req.body))));
 
 app.get('/hls/:id/:name', (req, res) => {
@@ -133,6 +157,9 @@ app.use((err, _req, res, _next) => {
 });
 
 const server = http.createServer(app);
+// The source ffmpeg uploads to the relay in one request that lasts as long as the stream, so the default
+// 5 minute request timeout must be off.
+server.requestTimeout = 0;
 const wss = new WebSocketServer({
   server,
   path: '/ws',

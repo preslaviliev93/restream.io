@@ -2,33 +2,38 @@ const { spawn, execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { buildArgs, protocolOf, authUrl, maskSecrets } = require('./ffmpeg');
+const ff = require('./ffmpeg');
+const { Worker } = require('./worker');
+const { Relay } = require('./relay');
 
+const { protocolOf, authUrl, maskSecrets, PRESETS } = ff;
 const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg';
 const FFPROBE = process.env.FFPROBE_PATH || 'ffprobe';
 const DATA_DIR = path.join(__dirname, '..', 'data');
 const SDP_DIR = path.join(DATA_DIR, 'sdp');
 const REC_DIR = path.resolve(process.env.RECORD_DIR || path.join(DATA_DIR, 'recordings'));
+const LOGO_DIR = path.resolve(process.env.LOGO_DIR || path.join(DATA_DIR, 'logos'));
 const REC_EXT = /\.(mkv|mp4|ts)$/i;
+const LOGO_EXT = /\.(png|jpe?g|webp)$/i;
 const recordDir = (id) => path.join(REC_DIR, id);
 const STORE = path.join(DATA_DIR, 'streams.json');
 
 const SERIES_EVERY_MS = 2000;       // long-term sample spacing used by the report
 const SERIES_MAX = 43200;           // 24 hours of samples
+const HISTORY_LEN = 240;
+const LOG_LEN = 1500;
+const SAMPLE_MS = 500;
+const WARMUP_SAMPLES = 6;
+
 const newReport = () => ({
   startedAt: Date.now(), runningMs: 0, lastTs: 0, lastSeries: 0, stalls: 0, warnings: 0, errors: 0,
-  base: { bytesOut: 0, bytesIn: 0, frames: 0, drops: 0, dups: 0, media: 0 },
+  base: { bytesOut: 0, frames: 0, drops: 0, dups: 0, media: 0 },
   series: [], events: [], msgs: new Map(),
 });
-const HISTORY_LEN = 240;
-const LOG_LEN = 500;
-const STALL_WARN_MS = 6000;
-const STALL_KILL_MS = 20000;
-// Messages that mean "this can never work with the current settings" (missing encoder or GPU), so retrying is pointless.
-const CONFIG_FATAL_RE = /cannot load (libcuda|nvcuda|libnvidia)|no capable devices|openencodesessionex|error creating a mfx session|libmfx|unknown encoder|encoder .{0,40} not found|error while opening encoder|could not open encoder/i;
-const PROBLEM_RE =/error|corrupt|missing|discontinuity|non[- ]monotonic|timed out|timeout|invalid|failed|dropp?ed|overrun/i;
 
-for (const d of [DATA_DIR, SDP_DIR]) fs.mkdirSync(d, { recursive: true });
+for (const d of [DATA_DIR, SDP_DIR, LOGO_DIR]) fs.mkdirSync(d, { recursive: true });
+
+const relay = new Relay();
 
 // In-memory HLS preview files, uploaded by ffmpeg over loopback HTTP and served to the browser.
 const hlsStore = {
@@ -49,43 +54,14 @@ const hlsStore = {
   },
 };
 
-// Parses an ffmpeg "Stream #0:0: Video: h264 (High), yuv420p, 1920x1080, 25 fps ..." report line.
-function parseStreamLine(line) {
-  const m = /Stream #\d+:\d+[^:]*: (Video|Audio): ([^,\s(]+)(.*)$/.exec(line);
-  if (!m) return null;
-  const [, type, codec, rest] = m;
-  const bitrate = Number((/(\d+) kb\/s/.exec(rest) || [])[1]) || 0;
-  if (type === 'Video') {
-    return {
-      kind: 'video',
-      data: {
-        codec,
-        // Only a real profile name; containers sometimes put a raw codec tag in the same brackets.
-        profile: ((/^\s*\(([^)]*)\)/.exec(rest) || [])[1] || '').replace(/^.*0x[0-9a-f]+.*$/i, ''),
-        pixFmt: (/,\s*((?:yuvj?|nv|gray|rgb|bgr|gbr|p0)\w*)/.exec(rest) || [])[1] || '',
-        resolution: (/\b(\d{2,5}x\d{2,5})\b/.exec(rest) || [])[1] || '',
-        aspect: (/DAR (\d+:\d+)/.exec(rest) || [])[1] || '',
-        fps: Number((/([\d.]+) fps/.exec(rest) || [])[1]) || 0,
-        bitrate,
-      },
-    };
-  }
-  return {
-    kind: 'audio',
-    data: {
-      codec,
-      sampleRate: Number((/(\d+) Hz/.exec(rest) || [])[1]) || 0,
-      channels: (/Hz, ([^,]+)/.exec(rest) || [])[1] || '',
-      bitrate,
-    },
-  };
-}
-
 const num = (v, min = 0) => {
   const n = Number(v);
   return Number.isFinite(n) && n >= min ? n : 0;
 };
 const str = (v) => (typeof v === 'string' ? v.trim() : '');
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+/* ------------------------------------------------------------------ validation */
 
 // Catches typos ffmpeg would only report at start time, e.g. udp://239.100.100:5000 (3-part address).
 function checkNetworkUrl(url, label) {
@@ -99,7 +75,8 @@ function checkNetworkUrl(url, label) {
   if (port && (+port < 1 || +port > 65535)) throw new Error(`${label} "${url}": port must be 1-65535`);
 }
 
-// ---- server video library ----
+/* ------------------------------------------------------------------ server video library */
+
 const MEDIA_DIR = path.resolve(process.env.MEDIA_DIR || path.join(DATA_DIR, 'media'));
 const PLAYLIST_DIR = path.join(DATA_DIR, 'playlists');
 const MEDIA_EXT = /\.(mp4|mkv|mov|avi|ts|webm|m4v|flv|mpg|mpeg|wmv)$/i;
@@ -115,55 +92,124 @@ function mediaPath(name) {
   return p;
 }
 
+function logoPath(name) {
+  if (path.basename(name) !== name || !LOGO_EXT.test(name)) throw new Error(`"${name}" is not a valid logo image name`);
+  const p = path.join(LOGO_DIR, name);
+  if (!fs.existsSync(p)) throw Object.assign(new Error(`Logo "${name}" is not on the server`), { status: 404 });
+  return p;
+}
+
 function writePlaylist(cfg) {
   const lines = cfg.input.files.map((f) => `file '${mediaPath(f).replace(/\\/g, '/').replace(/'/g, "'\\''")}'`);
   fs.writeFileSync(playlistPath(cfg.id), lines.join('\n') + '\n');
 }
 
-function normalize(raw, id, existing) {
-  const r = raw || {};
+/* ------------------------------------------------------------------ configuration */
+
+const POSITIONS = ['top-left', 'top-right', 'bottom-left', 'bottom-right', 'center'];
+const newId = () => crypto.randomBytes(4).toString('hex');
+
+function normalizeInput(r, id, existing) {
   const username = str(r.input?.username);
   // An empty password field on edit means "keep the saved one".
   const password = typeof r.input?.password === 'string' && r.input.password
     ? r.input.password
     : (username && existing?.input?.password) || '';
-  const isMedia = r.input?.type === 'media';
-  const files = isMedia ? (Array.isArray(r.input.files) ? r.input.files : []).map(str).filter(Boolean) : [];
-  if (isMedia) {
+  const type = ['media', 'listen'].includes(r.input?.type) ? r.input.type : 'url';
+  const base = {
+    type, files: [], playlist: false, url: '', username: '', password: '', listen: null,
+    rtspTransport: r.input?.rtspTransport === 'udp' ? 'udp' : 'tcp',
+    sdp: str(r.input?.sdp), loop: !!r.input?.loop, extra: str(r.input?.extra),
+  };
+
+  if (type === 'media') {
+    const files = (Array.isArray(r.input.files) ? r.input.files : []).map(str).filter(Boolean);
     if (!files.length) throw new Error('Choose at least one video from the server library');
     files.forEach(mediaPath);
+    // A single video is read directly; several are played in order through a generated concat list.
+    return { ...base, files, playlist: files.length > 1, url: files.length === 1 ? mediaPath(files[0]).replace(/\\/g, '/') : playlistPath(id) };
   }
-  // A single video is read directly; several are played in order through a generated concat list.
-  const url = isMedia ? (files.length === 1 ? mediaPath(files[0]).replace(/\\/g, '/') : playlistPath(id)) : str(r.input?.url);
+
+  if (type === 'listen') {
+    const l = r.input?.listen || {};
+    const protocol = l.protocol === 'srt' ? 'srt' : 'rtmp';
+    const port = Math.round(num(l.port));
+    if (port < 1 || port > 65535) throw new Error('Enter the port to listen on (1-65535)');
+    const key = str(l.key) || 'stream';
+    if (protocol === 'rtmp' && !/^[\w-]{1,64}$/.test(key)) throw new Error('The stream key may only contain letters, numbers, - and _');
+    const passphrase = typeof l.passphrase === 'string' && l.passphrase ? l.passphrase : (existing?.input?.listen?.passphrase || '');
+    if (protocol === 'srt' && passphrase && (passphrase.length < 10 || passphrase.length > 79)) throw new Error('An SRT passphrase must be 10 to 79 characters long');
+    return {
+      ...base,
+      listen: { protocol, port, key: protocol === 'rtmp' ? key : '', passphrase: protocol === 'srt' ? passphrase : '' },
+      url: protocol === 'rtmp' ? `rtmp://0.0.0.0:${port}/live/${key}` : `srt://0.0.0.0:${port}`,
+    };
+  }
+
+  const url = str(r.input?.url);
   if (!url) throw new Error('Input URL is required');
   if (url.startsWith('-')) throw new Error('Invalid input URL');
-  if (protocolOf(url) === 'rtp' && !str(r.input?.sdp)) throw new Error('rtp:// inputs need an SDP description');
+  if (protocolOf(url) === 'rtp' && !base.sdp) throw new Error('rtp:// inputs need an SDP description');
+  checkNetworkUrl(url, 'Input');
+  return { ...base, url, username, password: username ? password : '' };
+}
+
+function normalizePicture(p = {}) {
+  const t = p.text || {}, l = p.logo || {}, c = p.crop || {};
+  const crop = ['left', 'right', 'top', 'bottom'].reduce((o, k) => ({ ...o, [k]: Math.round(clamp(num(c[k]), 0, 3000)) }), {});
+  const picture = {
+    rotate: [90, 180, 270].includes(Number(p.rotate)) ? Number(p.rotate) : 0,
+    flipH: !!p.flipH,
+    flipV: !!p.flipV,
+    deinterlace: !!p.deinterlace,
+    crop,
+    text: {
+      enabled: !!t.enabled,
+      content: str(t.content).slice(0, 120),
+      clock: !!t.clock,
+      position: POSITIONS.includes(t.position) ? t.position : 'top-left',
+      size: ['small', 'medium', 'large'].includes(t.size) ? t.size : 'medium',
+      color: ['white', 'yellow', 'red', 'green', 'cyan', 'black'].includes(t.color) ? t.color : 'white',
+      box: t.box !== false,
+    },
+    logo: {
+      enabled: !!l.enabled,
+      file: str(l.file),
+      position: POSITIONS.includes(l.position) ? l.position : 'top-right',
+      sizePercent: Math.round(clamp(num(l.sizePercent) || 12, 3, 40)),
+      opacity: Math.round(clamp(num(l.opacity) || 100, 10, 100)),
+    },
+  };
+  if (picture.text.enabled && !picture.text.content && !picture.text.clock) throw new Error('Type the overlay text, or tick "Show date and time"');
+  if (picture.logo.enabled) logoPath(picture.logo.file);
+  return picture;
+}
+
+function normalize(raw, id, existing) {
+  const r = raw || {};
+  const input = normalizeInput(r, id, existing);
   const outputs = (r.outputs || [])
-    .map((o) => ({ url: str(o.url), enabled: o.enabled !== false }))
+    .map((o) => ({
+      id: /^[a-f0-9]{8}$/.test(o.id || '') ? o.id : newId(),
+      url: str(o.url),
+      enabled: o.enabled !== false,
+      preset: ['inherit', ...Object.keys(PRESETS)].includes(o.preset) ? o.preset : 'inherit',
+    }))
     .filter((o) => o.url);
+  const seen = new Set();
   for (const o of outputs) {
     if (o.url.startsWith('-')) throw new Error('Invalid output URL');
     checkNetworkUrl(o.url, 'Output');
+    while (seen.has(o.id)) o.id = newId();
+    seen.add(o.id);
   }
-  checkNetworkUrl(url, 'Input');
   if (!outputs.length && !r.preview && !r.record?.enabled) {
     throw new Error('Add a destination, or turn on the live preview or recording');
   }
   return {
     id,
     name: str(r.name) || `Stream ${id.slice(0, 4)}`,
-    input: {
-      type: isMedia ? 'media' : 'url',
-      files,
-      playlist: isMedia && files.length > 1,
-      url,
-      username,
-      password: username ? password : '',
-      rtspTransport: r.input?.rtspTransport === 'udp' ? 'udp' : 'tcp',
-      sdp: str(r.input?.sdp),
-      loop: !!r.input?.loop,
-      extra: str(r.input?.extra),
-    },
+    input,
     video: {
       mode: r.video?.mode === 'transcode' ? 'transcode' : 'copy',
       codec: str(r.video?.codec) || 'libx264',
@@ -180,9 +226,16 @@ function normalize(raw, id, existing) {
       bitrate: num(r.audio?.bitrate),
       sampleRate: num(r.audio?.sampleRate),
     },
+    picture: normalizePicture(r.picture),
+    audioFx: {
+      source: r.audioFx?.source === 'silence' ? 'silence' : 'original',
+      gainDb: Math.round(clamp(Number(r.audioFx?.gainDb) || 0, -30, 30) * 10) / 10,
+      normalize: !!r.audioFx?.normalize,
+    },
     outputs,
     extraOutputArgs: str(r.extraOutputArgs),
     preview: !!r.preview,
+    previewQuality: ['low', 'hd', 'copy'].includes(r.previewQuality) ? r.previewQuality : 'low',
     autoRestart: r.autoRestart !== false,
     autoStart: !!r.autoStart,
     record: {
@@ -193,62 +246,394 @@ function normalize(raw, id, existing) {
   };
 }
 
-class Runner {
+// Settings saved by older versions may lack the newer fields; run them through the same cleaning.
+function upgrade(cfg) {
+  try { return normalize(cfg, cfg.id, cfg); } catch { return { ...normalize({ ...cfg, picture: {}, preview: true }, cfg.id, cfg) }; }
+}
+
+/* ------------------------------------------------------------------ a stream */
+
+const STATE_OF = { running: 'running', restarting: 'down', starting: 'connecting', waiting: 'connecting' };
+
+class Stream {
   constructor(cfg) {
     this.cfg = cfg;
-    this.desired = false;
-    this.proc = null;
-    this.timer = null;
-    this.watchdog = null;
-    this.failures = 0;
+    this.started = false;
     this.rep = newReport();
-    this.resetRuntime();
-    this.restarts = 0;
     this.logs = [];
     this.newLogs = [];
+    this.fallback = { video: false, audio: false };
+    this.workers = new Map();      // worker id -> Worker; 'ingest', 'dest:<id>', 'record', 'preview'
+    this.sampler = null;
+    this.resetStats();
+    this.syncWorkers();
   }
 
-  resetRuntime() {
-    this.status = 'stopped';
-    this.startedAt = 0;
-    this.lastProgress = 0;
+  resetStats() {
     this.stats = { frame: 0, fps: 0, bitrate: 0, inBitrate: 0, speed: 0, size: 0, drop: 0, dup: 0, outTime: 0 };
-    this.inBytes = 0;
-    this.prevIn = 0;
-    this.stallFlag = false;
-    this.configError = '';
-    this.sampleCount = 0;
-    this.info = { format: '', bitrate: 0, video: null, audio: null, outputs: [] };
-    this.curOut = null;
     this.history = [];
-    this.counters = { warnings: 0, errors: 0 };
-    this.lastError = '';
-    this.command = '';
-    this.inInputSection = true;
-    this.prevSize = 0;
+    this.samples = 0;
+    this.prevBytes = 0;
     this.prevTs = 0;
+    this.lastError = '';
   }
 
-  get sdpPath() { return path.join(SDP_DIR, `${this.cfg.id}.sdp`); }
+  /* ---- workers ---- */
 
-  log(line) {
-    if (!line) return;
-    line = maskSecrets(line);
-    if (CONFIG_FATAL_RE.test(line)) this.configError = line;
-    const entry = `${new Date().toISOString().slice(11, 19)} ${line}`;
+  get ingest() { return this.workers.get('ingest'); }
+  get id() { return this.cfg.id; }
+  get sdpPath() { return path.join(SDP_DIR, `${this.cfg.id}.sdp`).replace(/\\/g, '/'); }
+
+  destIds() { return this.cfg.outputs.map((o) => `dest:${o.id}`); }
+
+  label(wid) {
+    if (wid === 'ingest') return 'source';
+    if (wid === 'record' || wid === 'preview') return wid;
+    return `dest ${this.destIds().indexOf(wid) + 1}`;
+  }
+
+  // The ffmpeg arguments a worker would use right now. forSig builds without time-dependent parts so two
+  // builds can be compared to see whether a settings change affects this worker.
+  argsFor(wid, forSig = false) {
+    const cfg = this.cfg;
+    const ingestWorker = this.workers.get('ingest');
+    // Signatures must depend on the settings only, never on what the source turned out to be at run time.
+    const srcH = forSig ? 0 : Number((/x(\d+)/.exec(ingestWorker?.info.video?.resolution || '') || [])[1]) || 0;
+    const ctx = {
+      sdpPath: this.sdpPath,
+      relayUrl: relay.url(cfg.id),
+      hlsUrl: `${hlsStore.ingestBase}/ingest/${hlsStore.token}/${cfg.id}/index.m3u8`,
+      fontFile: ff.findFont(),
+      logoPath: cfg.picture.logo.enabled && cfg.picture.logo.file ? logoPath(cfg.picture.logo.file).replace(/\\/g, '/') : '',
+      sourceHeight: srcH,
+      recDir: recordDir(cfg.id).replace(/\\/g, '/'),
+      recName: cfg.name.replace(/[^\w.-]+/g, '_').slice(0, 40) || 'stream',
+      recStamp: '0',
+    };
+    if (!forSig) {
+      const d = new Date();
+      const p2 = (n) => String(n).padStart(2, '0');
+      ctx.recStamp = `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}-${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`;
+    }
+    if (wid === 'ingest') {
+      if (!forSig) {
+        if (cfg.input.playlist) writePlaylist(cfg);
+        if (protocolOf(cfg.input.url) === 'rtp' && cfg.input.type === 'url') fs.writeFileSync(this.sdpPath, cfg.input.sdp.replace(/\r?\n/g, '\r\n') + '\r\n');
+      }
+      return ff.ingestArgs(cfg, ctx, forSig ? {} : this.fallback);
+    }
+    if (wid === 'record') {
+      if (!forSig) fs.mkdirSync(recordDir(cfg.id), { recursive: true });
+      return ff.recordArgs(cfg, ctx);
+    }
+    if (wid === 'preview') return ff.previewArgs(cfg, ctx);
+    const dest = cfg.outputs.find((o) => `dest:${o.id}` === wid);
+    if (!dest) throw new Error('This destination was removed');
+    return ff.destArgs(cfg, dest, ctx);
+  }
+
+  makeWorker(wid) {
+    const isIngest = wid === 'ingest';
+    const kind = isIngest ? 'ingest' : wid.startsWith('dest:') ? 'dest' : wid;
+    const listen = isIngest && this.cfg.input.type === 'listen';
+    const w = new Worker({
+      id: wid,
+      kind,
+      ffmpeg: FFMPEG,
+      outKind: isIngest ? 'relay' : kind,
+      quietUntilData: listen,
+      autoRestart: () => this.cfg.autoRestart || (isIngest && this.cfg.input.type === 'listen'),
+      build: () => this.argsFor(wid),
+      // Everything except the ingest reads the relay, so it waits until the source is delivering.
+      ready: isIngest ? null : () => relay.live(this.cfg.id),
+      expectErrors: isIngest ? null : () => !relay.live(this.cfg.id) || !this.started,
+      onExit: isIngest ? (info) => this.onIngestExit(info) : undefined,
+    });
+    w.sig = '';
+    this.wire(w, wid);
+    return w;
+  }
+
+  wire(w, wid) {
+    const isIngest = wid === 'ingest';
+    w.on('log', (line) => this.addLog(this.label(wid), line));
+    w.on('problem', (line, level) => {
+      this.rep[level === 'error' ? 'errors' : 'warnings']++;
+      this.countMessage(line, level);
+      if (isIngest && level === 'error') this.lastError = line;
+    });
+    w.on('state', (s) => {
+      if (isIngest && s === 'running') { this.lastError = ''; this.addEvent('Connected, receiving data', 'running'); }
+    });
+    if (isIngest) w.on('inputinfo', (info) => this.checkRelayCompat(w, info));
+    w.on('stalled', (secs) => {
+      if (!isIngest) return;
+      this.rep.stalls++;
+      this.addEvent(`No data for ${secs} s`, 'down');
+    });
+    w.on('resumed', () => { if (isIngest) this.addEvent('Data resumed', 'running'); });
+    w.on('restarting', (code, delay) => {
+      if (isIngest && this.pendingFallback) { this.pendingFallback = false; return; }   // planned restart, not a failure
+      if (isIngest) {
+        this.addEvent(this.cfg.input.type === 'listen' ? 'Sender disconnected, waiting for a new connection'
+          : `Connection lost (code ${code}), reconnecting in ${delay / 1000} s`, 'down');
+      } else {
+        this.addEvent(`${this.label(wid)} restarted (code ${code})`, this.eventState());
+      }
+    });
+    w.on('exit', () => {
+      const b = this.rep.base;
+      if (isIngest) { b.media += w.stats.outTime; return; }
+      if (w.kind === 'dest') { b.bytesOut += w.stats.size; b.frames += w.stats.frame; b.drops += w.stats.drop; b.dups += w.stats.dup; }
+    });
+    w.on('fatal', (msg) => {
+      if (isIngest) {
+        this.lastError = msg;
+        this.addEvent('Stopped: the source cannot be used (see the log)', 'stopped');
+        this.haltAll();
+      } else {
+        this.addEvent(`${this.label(wid)} stopped: ${msg.replace(/^\[[^\]]*\]\s*/, '').slice(0, 120)}`, this.eventState());
+      }
+    });
+    w.on('gaveup', () => {
+      if (isIngest) { this.addEvent('Stopped after an error', 'stopped'); this.haltAll(); }
+    });
+  }
+
+  eventState() { return STATE_OF[this.ingest?.status] || 'stopped'; }
+
+  // The relay carries MPEG-TS. Codecs it cannot describe properly (PCM audio, MJPEG video, ...) would be passed as
+  // anonymous data and silently lost downstream, so they are converted at the source instead: audio to AAC, video to H.264.
+  checkRelayCompat(worker, info) {
+    const AUDIO_OK = /^(aac|mp3|mp2|ac3|eac3|dts|opus)$/i;
+    const VIDEO_OK = /^(h264|hevc|mpeg2video|mpeg1video|mpeg4)$/i;
+    const notes = [];
+    if (info.audio && !AUDIO_OK.test(info.audio.codec) && !this.fallback.audio) {
+      this.fallback.audio = true;
+      notes.push(`the source audio (${info.audio.codec}) is converted to AAC`);
+    }
+    if (info.video && !VIDEO_OK.test(info.video.codec) && !this.fallback.video) {
+      this.fallback.video = true;
+      notes.push(`the source video (${info.video.codec}) is converted to H.264`);
+    }
+    if (!notes.length) return;
+    worker.note(`> ${notes.join(' and ')} so that every part of the stream can use it; restarting the source`);
+    this.pendingFallback = true;
+    worker.proc?.kill();
+  }
+
+  // Decides what happens when the source process ends.
+  onIngestExit({ code, worker }) {
+    const cfg = this.cfg;
+    if (this.pendingFallback) return 'immediate';
+    // The relay is MPEG-TS, which cannot hold some codecs (PCM audio, MJPEG video, ...): convert just that part and retry.
+    const tail = worker.recent.slice(-25).join('\n');
+    if (/could not find tag for codec|not currently supported in container|could not write header/i.test(tail)) {
+      const audio = worker.info.audio?.codec, video = worker.info.video?.codec;
+      const mentions = (c) => c && new RegExp(`\\b${c}\\b`, 'i').test(tail);
+      const compatibleAudio = /^(aac|mp3|mp2|ac3|eac3|opus|dts)$/i;
+      if (!this.fallback.audio && audio && (mentions(audio) || (!mentions(video) && !compatibleAudio.test(audio)))) {
+        this.fallback.audio = true;
+        worker.note(`> the source audio (${audio}) cannot go through the relay as-is, converting it to AAC`);
+        return 'immediate';
+      }
+      if (!this.fallback.video && video) {
+        this.fallback.video = true;
+        worker.note(`> the source video (${video}) cannot go through the relay as-is, converting it to H.264`);
+        return 'immediate';
+      }
+    }
+    if (cfg.input.type === 'listen') return 'immediate';
+    const finite = (cfg.input.type === 'media' && !cfg.input.loop)
+      || (cfg.input.type === 'url' && !cfg.input.loop && ['file', 'http', 'https'].includes(protocolOf(cfg.input.url)));
+    if (code === 0 && finite) {
+      this.addEvent('Finished (end of source)', 'stopped');
+      this.haltAll();
+      return 'finished';
+    }
+    return undefined;
+  }
+
+  // Stops every worker without touching the ingest that is calling us.
+  haltAll() {
+    this.started = false;
+    for (const w of this.workers.values()) if (w.id !== 'ingest') w.stop();
+    this.stopSampler();
+  }
+
+  // Creates or removes workers so they match the current settings. Returns the ids that need a restart.
+  syncWorkers() {
+    const want = ['ingest', ...this.destIds()];
+    if (this.cfg.record.enabled) want.push('record');
+    if (this.cfg.preview) want.push('preview');
+    const restart = [];
+    for (const wid of [...this.workers.keys()]) {
+      if (!want.includes(wid)) {
+        this.workers.get(wid).stop();
+        this.workers.delete(wid);
+      }
+    }
+    for (const wid of want) {
+      let w = this.workers.get(wid);
+      if (!w) {
+        w = this.makeWorker(wid);
+        this.workers.set(wid, w);
+        if (this.started && wid !== 'ingest' && this.autoWorker(wid)) w.start();
+      }
+      // A listener behaves differently from other sources (no stall kill, restarts quickly), so rebuild it if the type changed.
+      if (wid === 'ingest' && w.opts.quietUntilData !== (this.cfg.input.type === 'listen')) {
+        w.opts.quietUntilData = this.cfg.input.type === 'listen';
+      }
+      let sig = '';
+      try { sig = JSON.stringify(this.argsFor(wid, true)); } catch (e) { sig = `error:${e.message}`; }
+      if (w.sig && w.sig !== sig && w.desired) restart.push(wid);
+      w.sig = sig;
+    }
+    return restart;
+  }
+
+  // Whether a worker starts together with the stream (disabled destinations stay off until switched on by hand).
+  autoWorker(wid) {
+    if (wid.startsWith('dest:')) return this.cfg.outputs.find((o) => `dest:${o.id}` === wid)?.enabled;
+    return true;
+  }
+
+  async applyConfig(cfg) {
+    const prevInput = JSON.stringify(this.cfg.input);
+    const wasOn = new Map(this.cfg.outputs.map((o) => [`dest:${o.id}`, o.enabled]));
+    this.cfg = cfg;
+    if (prevInput !== JSON.stringify(cfg.input)) this.fallback = { video: false, audio: false };
+    const restart = this.syncWorkers();
+    if (!this.started) return;
+    // Ticking or unticking "On" for an existing destination starts or stops it straight away.
+    for (const o of cfg.outputs) {
+      const wid = `dest:${o.id}`;
+      if (wasOn.has(wid) && wasOn.get(wid) !== o.enabled) {
+        if (o.enabled) this.workers.get(wid).start(); else this.workers.get(wid).stop();
+      }
+    }
+    // The source restarts first when it changed: that also disconnects every reader, which then reconnect on their own.
+    const ordered = restart.includes('ingest') ? ['ingest'] : restart;
+    for (const wid of ordered) {
+      this.addEvent(`Settings changed: restarting ${this.label(wid)}`, this.eventState());
+      this.workers.get(wid).restart();
+    }
+  }
+
+  /* ---- control ---- */
+
+  start() {
+    if (this.started) return;
+    this.started = true;
+    this.rep = newReport();
+    this.resetStats();
+    this.fallback = { video: false, audio: false };
+    relay.reset(this.id);
+    hlsStore.clear(this.id);
+    for (const w of this.workers.values()) w.resetReport();
+    this.addEvent('Started', 'connecting');
+    this.syncWorkers();
+    this.ingest.start();
+    for (const [wid, w] of this.workers) if (wid !== 'ingest' && this.autoWorker(wid)) w.start();
+    this.startSampler();
+  }
+
+  async stop() {
+    const wasStarted = this.started;
+    this.started = false;
+    this.stopSampler();
+    await Promise.all([...this.workers.values()].map((w) => w.stop()));
+    relay.reset(this.id);
+    hlsStore.clear(this.id);
+    if (wasStarted) this.addEvent('Stopped', 'stopped');
+  }
+
+  async control(wid, action) {
+    const w = this.workers.get(wid);
+    if (!w) throw Object.assign(new Error('Unknown part of the stream'), { status: 404 });
+    if (!this.started) throw new Error('Start the stream first');
+    if (action === 'start') w.start();
+    else if (action === 'stop') await w.stop();
+    else if (action === 'restart') {
+      // Restarting the source restarts everything that reads it, which is what the user expects.
+      await w.restart();
+    } else throw new Error('Unknown action');
+    this.addEvent(`${this.label(wid)}: ${action} requested`, this.eventState());
+  }
+
+  /* ---- sampling ---- */
+
+  startSampler() {
+    this.stopSampler();
+    this.sampler = setInterval(() => this.sample(), SAMPLE_MS);
+  }
+
+  stopSampler() {
+    clearInterval(this.sampler);
+    this.sampler = null;
+  }
+
+  // The destination whose numbers represent the stream: the first one that is delivering.
+  primary() {
+    for (const wid of this.destIds()) {
+      const w = this.workers.get(wid);
+      if (w && w.status === 'running') return w;
+    }
+    for (const wid of ['record', 'preview']) {
+      const w = this.workers.get(wid);
+      if (w && w.status === 'running') return w;
+    }
+    return null;
+  }
+
+  sample() {
+    const now = Date.now();
+    const ing = this.ingest;
+    const s = this.stats;
+    const bytes = relay.bytes(this.id);
+    if (this.prevTs && now > this.prevTs) {
+      const kbps = ((bytes - this.prevBytes) * 8) / ((now - this.prevTs) / 1000) / 1000;
+      s.inBitrate = s.inBitrate ? s.inBitrate * 0.6 + kbps * 0.4 : kbps;
+    }
+    this.prevBytes = bytes;
+    this.prevTs = now;
+    if (ing.status !== 'running' || !relay.live(this.id)) { if (ing.status !== 'running') s.inBitrate = 0; return; }
+
+    const p = this.primary();
+    const src = p || ing;
+    s.frame = src.stats.frame; s.size = src.stats.size; s.drop = src.stats.drop; s.dup = src.stats.dup; s.outTime = src.stats.outTime;
+    s.bitrate = p ? p.stats.bitrate : 0;
+    s.fps = p ? p.stats.fps : ing.stats.fps;
+    // Speed: the slowest running process decides whether the server keeps up with real time.
+    const speeds = [...this.workers.values()].filter((w) => w.status === 'running' && w.stats.speed > 0).map((w) => w.stats.speed);
+    s.speed = speeds.length ? Math.min(...speeds) : 0;
+
+    const rep = this.rep;
+    if (rep.lastTs) rep.runningMs += Math.min(now - rep.lastTs, 2000);
+    rep.lastTs = now;
+    if (++this.samples <= WARMUP_SAMPLES) return;
+    if (now - rep.lastSeries >= SERIES_EVERY_MS) {
+      rep.lastSeries = now;
+      rep.series.push({ t: now, i: +s.inBitrate.toFixed(1), o: +s.bitrate.toFixed(1), f: s.fps, s: s.speed });
+      if (rep.series.length > SERIES_MAX) rep.series.shift();
+    }
+    this.history.push({ t: now, bitrate: +s.bitrate.toFixed(1), inBitrate: +s.inBitrate.toFixed(1), fps: s.fps, speed: s.speed });
+    if (this.history.length > HISTORY_LEN) this.history.shift();
+  }
+
+  /* ---- logs and events ---- */
+
+  addLog(label, line) {
+    const entry = `${new Date().toISOString().slice(11, 19)} [${label}] ${line}`;
     this.logs.push(entry);
     if (this.logs.length > LOG_LEN) this.logs.shift();
     this.newLogs.push(entry);
-    if (/error|failed|invalid|no such|refused|unable|could not/i.test(line)) {
-      this.counters.errors++;
-      this.rep.errors++;
-      this.lastError = line;
-      this.countMessage(line, 'error');
-    } else if (PROBLEM_RE.test(line)) {
-      this.counters.warnings++;
-      this.rep.warnings++;
-      this.countMessage(line, 'warning');
-    }
+  }
+
+  drainLogs() {
+    const l = this.newLogs;
+    this.newLogs = [];
+    return l;
   }
 
   // Groups repeated problem lines (numbers and addresses stripped) so the report can show the noisy ones.
@@ -268,244 +653,100 @@ class Runner {
     if (this.rep.events.length > 300) this.rep.events.shift();
   }
 
-  start() {
-    this.desired = true;
-    if (this.proc || this.timer) return;
-    this.failures = 0;
-    this.rep = newReport();
-    this.addEvent('Started', 'connecting');
-    this.spawnProc();
+  /* ---- views used by the dashboard and the report ---- */
+
+  get status() {
+    const ing = this.ingest.status;
+    if (ing === 'error') return 'error';
+    if (!this.started) return ing === 'stopping' ? 'stopping' : 'stopped';
+    if (ing === 'starting' && this.cfg.input.type === 'listen') return 'waiting';
+    return ing;
   }
 
-  spawnProc() {
-    this.timer = null;
-    const cfg = this.cfg;
-    hlsStore.clear(cfg.id);
-    if (cfg.input.playlist) writePlaylist(cfg);
-    if (protocolOf(cfg.input.url) === 'rtp') fs.writeFileSync(this.sdpPath, cfg.input.sdp.replace(/\r?\n/g, '\r\n') + '\r\n');
+  get proc() { return this.started ? this.ingest.proc : null; }
+  get inBytes() { return relay.bytes(this.id); }
+  get restarts() { return this.ingest.restarts; }
+  get startedAt() { return this.ingest.startedAt; }
 
-    const d = new Date();
-    const p2 = (n) => String(n).padStart(2, '0');
-    if (cfg.record?.enabled) fs.mkdirSync(recordDir(cfg.id), { recursive: true });
-    const args = buildArgs(cfg, {
-      hlsUrl: `${hlsStore.ingestBase}/ingest/${hlsStore.token}/${cfg.id}/index.m3u8`,
-      tapUrl: `${hlsStore.ingestBase}/tap/${hlsStore.token}/${cfg.id}`,
-      sdpPath: this.sdpPath.replace(/\\/g, '/'),
-      recDir: recordDir(cfg.id).replace(/\\/g, '/'),
-      recName: cfg.name.replace(/[^\w.-]+/g, '_').slice(0, 40) || 'stream',
-      recStamp: `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}-${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`,
-    });
-    const prevRestarts = this.restarts;
-    this.resetRuntime();
-    this.restarts = prevRestarts;
-    this.status = 'starting';
-    this.startedAt = Date.now();
-    this.lastProgress = Date.now();
-    this.command = maskSecrets([FFMPEG, ...args].map((x) => (/\s/.test(x) ? `"${x}"` : x)).join(' '));
-    this.log(`> starting ffmpeg (restart #${this.restarts})`);
-
-    let proc;
-    try {
-      proc = spawn(FFMPEG, args, { windowsHide: true });
-    } catch (e) {
-      return this.onExit(-1, e.message);
+  get info() {
+    const ing = this.ingest.info;
+    const outputs = [];
+    for (const [wid, w] of this.workers) {
+      if (wid === 'ingest') continue;
+      const o = w.info.outputs[0];
+      if (o) outputs.push({ ...o, id: wid, index: outputs.length, url: wid.startsWith('dest:') ? maskSecrets(o.url) : o.url });
     }
-    this.proc = proc;
-    this.pipeLines(proc.stderr, (l) => this.onStderr(l));
-    this.pipeLines(proc.stdout, (l) => this.onProgress(l));
-    proc.on('error', (e) => { this.log(`spawn error: ${e.message}`); this.lastError = e.message; this.counters.errors++; });
-    proc.on('close', (code) => this.onExit(code));
-    clearInterval(this.watchdog);
-    this.watchdog = setInterval(() => this.checkStall(), 2000);
+    return { format: ing.format, bitrate: ing.bitrate, video: ing.video, audio: ing.audio, outputs };
   }
 
-  pipeLines(stream, cb) {
-    let buf = '';
-    stream.on('data', (d) => {
-      buf += d.toString('utf8');
-      const parts = buf.split(/\r\n|\n|\r/);
-      buf = parts.pop();
-      parts.forEach((l) => cb(l.trim()));
-    });
+  get command() {
+    const parts = [];
+    for (const [wid, w] of this.workers) if (w.command) parts.push(`# ${this.label(wid)}\n${w.command}`);
+    return parts.join('\n\n');
   }
 
-  onStderr(line) {
-    if (!line) return;
-    line = maskSecrets(line);
-    let m;
-    if ((m = /^Input #0, ([^,]+),/.exec(line))) {
-      this.info.format = m[1].trim();
-    } else if ((m = /^Output #(\d+), ([^,]+), to '(.*)':/.exec(line))) {
-      this.inInputSection = false;
-      // ffmpeg does not always print outputs in command order, so keep its own number and sort by it.
-      // Internal outputs (preview, recording, bitrate tap) are tagged so the UI can label or hide them.
-      const url = m[3], norm = url.replace(/\\/g, '/');
-      const kind = url.includes('/tap/') ? 'tap' : url.includes('/ingest/') ? 'preview'
-        : norm.startsWith(recordDir(this.cfg.id).replace(/\\/g, '/')) ? 'record' : 'dest';
-      this.curOut = { index: Number(m[1]), kind, format: m[2].trim(), url, video: null, audio: null };
-      this.info.outputs.push(this.curOut);
-      this.info.outputs.sort((a, b) => a.index - b.index);
-    } else if (this.inInputSection && (m = /Duration: .*?bitrate: (\d+) kb\/s/.exec(line))) {
-      this.info.bitrate = Number(m[1]);
-    } else {
-      const st = parseStreamLine(line);
-      if (st) {
-        const target = this.inInputSection ? this.info : this.curOut;
-        if (target && !target[st.kind]) target[st.kind] = st.data;
-      }
-    }
-    this.log(line);
+  get counters() {
+    return { warnings: this.rep.warnings, errors: this.rep.errors };
   }
 
-  onProgress(line) {
-    const i = line.indexOf('=');
-    if (i < 0) return;
-    const k = line.slice(0, i);
-    const v = line.slice(i + 1);
-    const s = this.stats;
-    switch (k) {
-      case 'frame': s.frame = num(v); break;
-      case 'fps': s.fps = num(v); break;
-      case 'total_size': s.size = num(v); break;
-      case 'out_time_us': s.outTime = num(v) / 1e6; break;
-      case 'drop_frames': s.drop = num(v); break;
-      case 'dup_frames': s.dup = num(v); break;
-      case 'speed': s.speed = parseFloat(v) || 0; break;
-      case 'progress': if (v !== 'end') this.commitSample(); break;   // the final block is printed on exit, not a sign of life
-      default:
+  // What the destinations have delivered so far in this session (finished runs plus the ones still running).
+  currentTotals() {
+    const t = { bytesOut: 0, frames: 0, drops: 0, dups: 0, media: this.ingest.proc ? this.ingest.stats.outTime : 0 };
+    for (const [wid, w] of this.workers) {
+      if (!wid.startsWith('dest:') || !w.proc) continue;
+      t.bytesOut += w.stats.size; t.frames += w.stats.frame; t.drops += w.stats.drop; t.dups += w.stats.dup;
     }
+    return t;
   }
 
-  commitSample() {
-    const now = Date.now();
-    const s = this.stats;
-    // Bitrates come from byte deltas, lightly smoothed because video arrives in bursts (keyframes).
-    // Output: ffmpeg's total_size covers its first output only. Input: bytes counted from the copy tap.
-    if (this.prevTs && now > this.prevTs) {
-      const secs = (now - this.prevTs) / 1000;
-      const smooth = (old, next) => (old ? old * 0.6 + next * 0.4 : next);
-      if (s.size >= this.prevSize) s.bitrate = smooth(s.bitrate, ((s.size - this.prevSize) * 8) / secs / 1000);
-      s.inBitrate = smooth(s.inBitrate, ((this.inBytes - this.prevIn) * 8) / secs / 1000);
+  destinationReport() {
+    const rows = [];
+    for (const wid of [...this.destIds(), 'record', 'preview']) {
+      const w = this.workers.get(wid);
+      if (!w) continue;
+      const dest = wid.startsWith('dest:') ? this.cfg.outputs.find((o) => `dest:${o.id}` === wid) : null;
+      rows.push({
+        id: wid, kind: w.kind, label: this.label(wid), url: dest ? maskSecrets(dest.url) : '', preset: dest ? dest.preset : '',
+        status: w.status, restarts: w.restarts, runningMs: w.rep.runningMs, errors: w.rep.errors, warnings: w.rep.warnings,
+        avgBitrate: w.rep.bitrateN ? w.rep.bitrateSum / w.rep.bitrateN : 0, maxBitrate: w.rep.bitrateMax,
+        avgFps: w.rep.bitrateN ? w.rep.fpsSum / w.rep.bitrateN : 0,
+      });
     }
-    this.prevSize = s.size;
-    this.prevIn = this.inBytes;
-    this.prevTs = now;
-    this.lastProgress = now;
-    if (this.status === 'starting') {
-      this.status = 'running';
-      this.failures = 0;
-      this.addEvent('Connected, receiving data', 'running');
-    }
-    const rep = this.rep;
-    if (this.stallFlag) { this.stallFlag = false; this.addEvent('Data resumed', 'running'); }
-    if (rep.lastTs) rep.runningMs += Math.min(now - rep.lastTs, 2000);
-    rep.lastTs = now;
-    // The first samples after a (re)start are still warming up (0 fps, no bytes yet), so keep them out of the statistics.
-    if (++this.sampleCount > 3 && now - rep.lastSeries >= SERIES_EVERY_MS) {
-      rep.lastSeries = now;
-      rep.series.push({ t: now, i: +s.inBitrate.toFixed(1), o: +s.bitrate.toFixed(1), f: s.fps, s: s.speed });
-      if (rep.series.length > SERIES_MAX) rep.series.shift();
-    }
-    if (this.sampleCount > 3) {
-      this.history.push({ t: now, bitrate: +s.bitrate.toFixed(1), inBitrate: +s.inBitrate.toFixed(1), fps: s.fps, speed: s.speed });
-      if (this.history.length > HISTORY_LEN) this.history.shift();
-    }
+    return rows;
   }
 
-  checkStall() {
-    if (!this.proc) return;
-    const idle = Date.now() - this.lastProgress;
-    if (idle > STALL_WARN_MS && this.status === 'running' && !this.stallFlag) {
-      this.stallFlag = true;
-      this.rep.stalls++;
-      this.addEvent(`No data for ${Math.round(idle / 1000)} s`, 'down');
+  workerViews() {
+    const rows = [];
+    for (const [wid, w] of this.workers) {
+      const dest = wid.startsWith('dest:') ? this.cfg.outputs.find((o) => `dest:${o.id}` === wid) : null;
+      rows.push({
+        ...w.snapshot(),
+        label: this.label(wid),
+        url: dest ? maskSecrets(dest.url) : wid === 'ingest' ? maskSecrets(this.cfg.input.url) : '',
+        preset: dest ? dest.preset : '',
+        enabled: dest ? dest.enabled : true,
+        history: w.history.slice(-60).map((h) => h.bitrate),
+      });
     }
-    if (idle > STALL_KILL_MS) {
-      this.log(`! no data for ${Math.round(idle / 1000)}s, killing ffmpeg`);
-      this.proc.kill();
-    }
-  }
-
-  get stalled() {
-    return !!this.proc && this.status === 'running' && Date.now() - this.lastProgress > STALL_WARN_MS;
-  }
-
-  onExit(code, msg) {
-    clearInterval(this.watchdog);
-    this.proc = null;
-    this.log(`> ffmpeg exited (code ${code}${msg ? `: ${msg}` : ''})`);
-    const ranFor = Date.now() - this.startedAt;
-    this.stats.bitrate = 0;
-    this.stats.inBitrate = 0;
-    this.stats.fps = 0;
-    hlsStore.clear(this.cfg.id);
-    const b = this.rep.base, st = this.stats;
-    b.bytesOut += st.size; b.bytesIn += this.inBytes; b.frames += st.frame; b.drops += st.drop; b.dups += st.dup; b.media += st.outTime;
-    if (!this.desired) {
-      this.status = 'stopped';
-      this.addEvent('Stopped', 'stopped');
-      return;
-    }
-    if (this.configError && (this.status === 'starting' || this.stats.frame === 0)) {
-      // Failed before any data flowed because of an unusable encoder or GPU: retrying would loop forever.
-      this.desired = false;
-      this.status = 'error';
-      this.lastError = this.configError;
-      this.addEvent('Stopped: the selected encoder is not available on this server', 'stopped');
-      return;
-    }
-    if (code === 0) {
-      // Finite source (file) reached its end.
-      this.desired = false;
-      this.status = 'stopped';
-      this.addEvent('Finished (end of source)', 'stopped');
-      return;
-    }
-    if (!this.cfg.autoRestart) {
-      this.desired = false;
-      this.status = 'error';
-      this.addEvent(`Stopped after an error (code ${code})`, 'stopped');
-      return;
-    }
-    if (ranFor > 30000) this.failures = 0;
-    const delay = Math.min(2000 * 2 ** this.failures, 15000);
-    this.failures++;
-    this.restarts++;
-    this.status = 'restarting';
-    this.log(`> restarting in ${delay / 1000}s`);
-    this.addEvent(`Connection lost (code ${code}), reconnecting in ${delay / 1000} s`, 'down');
-    this.timer = setTimeout(() => this.spawnProc(), delay);
-  }
-
-  stop() {
-    this.desired = false;
-    clearTimeout(this.timer);
-    this.timer = null;
-    if (!this.proc) {
-      if (this.status !== 'stopped') this.addEvent('Stopped', 'stopped');
-      this.status = 'stopped';
-      return Promise.resolve();
-    }
-    const proc = this.proc;
-    this.status = 'stopping';
-    return new Promise((resolve) => {
-      const kill = setTimeout(() => proc.kill(), 3000);
-      proc.once('close', () => { clearTimeout(kill); resolve(); });
-      try { proc.stdin.write('q'); } catch { proc.kill(); }
-    });
+    return rows;
   }
 
   snapshot() {
-    const up = this.proc && this.startedAt ? Date.now() - this.startedAt : 0;
+    const ing = this.ingest;
     return {
       ...this.cfg,
-      // The saved password never leaves the server; the form only learns that one is set.
-      input: { ...this.cfg.input, password: '', passwordSet: !!this.cfg.input.password },
+      // Saved secrets never leave the server; the form only learns that they are set.
+      input: {
+        ...this.cfg.input,
+        password: '',
+        passwordSet: !!this.cfg.input.password,
+        listen: this.cfg.input.listen ? { ...this.cfg.input.listen, passphrase: '', passphraseSet: !!this.cfg.input.listen.passphrase } : null,
+      },
       runtime: {
         status: this.status,
-        stalled: this.stalled,
-        startedAt: this.proc ? this.startedAt : 0,
-        uptime: up,
+        stalled: this.started && ing.stalled,
+        startedAt: this.proc ? ing.startedAt : 0,
+        uptime: this.proc && ing.startedAt ? Date.now() - ing.startedAt : 0,
         restarts: this.restarts,
         stats: this.stats,
         info: this.info,
@@ -513,16 +754,33 @@ class Runner {
         counters: this.counters,
         lastError: this.lastError,
         command: this.command,
+        fallback: this.fallback,
+        relay: { live: relay.live(this.id), readers: relay.readers(this.id), bytes: relay.bytes(this.id) },
+        workers: this.workerViews(),
       },
     };
   }
 
-  drainLogs() {
-    const l = this.newLogs;
-    this.newLogs = [];
-    return l;
+  // One JPEG of the live picture.
+  snapshotJpeg() {
+    if (!relay.live(this.id)) return Promise.reject(Object.assign(new Error('The stream is not delivering video right now'), { status: 409 }));
+    return new Promise((resolve, reject) => {
+      const p = spawn(FFMPEG, ff.snapshotArgs({ relayUrl: relay.url(this.id) }), { windowsHide: true });
+      const chunks = [];
+      const timer = setTimeout(() => p.kill(), 15000);
+      p.stdout.on('data', (c) => chunks.push(c));
+      p.on('error', (e) => { clearTimeout(timer); reject(e); });
+      p.on('close', () => {
+        clearTimeout(timer);
+        const buf = Buffer.concat(chunks);
+        if (buf.length > 100) resolve(buf);
+        else reject(new Error('Could not capture a picture (no video yet?)'));
+      });
+    });
   }
 }
+
+/* ------------------------------------------------------------------ manager */
 
 class Manager {
   constructor() {
@@ -533,7 +791,8 @@ class Manager {
   load() {
     try {
       const list = JSON.parse(fs.readFileSync(STORE, 'utf8'));
-      for (const cfg of list) this.runners.set(cfg.id, new Runner(cfg));
+      for (const cfg of list) this.runners.set(cfg.id, new Stream(upgrade(cfg)));
+      this.save();   // settings from an older version now have the newer fields and stable destination ids
     } catch { /* first run */ }
   }
 
@@ -571,27 +830,43 @@ class Manager {
     if (cfg.audio.mode === 'transcode') bad(cfg.audio.codec, 'audio');
   }
 
+  // Two streams cannot listen on the same port.
+  checkListenPorts(cfg) {
+    if (cfg.input.type !== 'listen') return;
+    for (const r of this.runners.values()) {
+      const l = r.cfg.input.listen;
+      if (r.cfg.id !== cfg.id && r.cfg.input.type === 'listen' && l.port === cfg.input.listen.port && l.protocol === cfg.input.listen.protocol) {
+        throw new Error(`The stream "${r.cfg.name}" already listens on ${l.protocol.toUpperCase()} port ${l.port}. Choose another port.`);
+      }
+    }
+  }
+
   async create(body) {
     const id = crypto.randomUUID();
     const cfg = normalize(body, id);
     this.checkEncoders(cfg);
-    const runner = new Runner(cfg);
-    this.runners.set(id, runner);
+    this.checkListenPorts(cfg);
+    const stream = new Stream(cfg);
+    this.runners.set(id, stream);
     this.save();
-    return runner.snapshot();
+    return stream.snapshot();
   }
 
   async update(id, body) {
-    const runner = this.get(id);
-    const cfg = normalize(body, id, runner.cfg);
+    const stream = this.get(id);
+    const cfg = normalize(body, id, stream.cfg);
     this.checkEncoders(cfg);
-    const wasRunning = runner.desired;
-    await runner.stop();
-    runner.cfg = cfg;
+    this.checkListenPorts(cfg);
+    await stream.applyConfig(cfg);
     this.save();
-    if (wasRunning) runner.start();
-    return runner.snapshot();
+    return stream.snapshot();
   }
+
+  async control(id, wid, action) {
+    await this.get(id).control(wid, action);
+  }
+
+  /* ---- media library ---- */
 
   mediaList() {
     const files = fs.readdirSync(MEDIA_DIR)
@@ -612,12 +887,32 @@ class Manager {
     fs.rmSync(p);
   }
 
+  /* ---- logo images ---- */
+
+  logoList() {
+    const files = fs.readdirSync(LOGO_DIR)
+      .filter((n) => LOGO_EXT.test(n))
+      .map((name) => ({ name, size: fs.statSync(path.join(LOGO_DIR, name)).size }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    return { files };
+  }
+
+  logoDelete(name) {
+    const p = logoPath(name);
+    const user = [...this.runners.values()].find((r) => r.cfg.picture.logo.enabled && r.cfg.picture.logo.file === name);
+    if (user) throw new Error(`"${name}" is used by the stream "${user.cfg.name}". Remove it from that stream first.`);
+    fs.rmSync(p);
+  }
+
+  /* ---- recordings ---- */
+
   recordings(id) {
-    const runner = this.get(id);
+    const stream = this.get(id);
     const dir = recordDir(id);
     let names = [];
     try { names = fs.readdirSync(dir).filter((n) => REC_EXT.test(n)); } catch { /* nothing recorded yet */ }
-    const recording = runner.cfg.record.enabled && runner.status === 'running';
+    const rec = stream.workers.get('record');
+    const recording = !!rec && rec.status === 'running';
     // Windows reports stale size/mtime for a file that is still open, so the newest file of a running
     // recording is simply treated as the active one instead of guessing from timestamps.
     const files = names
@@ -639,11 +934,12 @@ class Manager {
   }
 
   async remove(id) {
-    const runner = this.get(id);
-    await runner.stop();
+    const stream = this.get(id);
+    await stream.stop();
     this.runners.delete(id);
+    relay.reset(id);
     hlsStore.clear(id);
-    fs.rmSync(runner.sdpPath, { force: true });
+    fs.rmSync(stream.sdpPath, { force: true });
     fs.rmSync(playlistPath(id), { force: true });
     this.save();
   }
@@ -652,6 +948,8 @@ class Manager {
     await Promise.all([...this.runners.values()].map((r) => r.stop()));
   }
 }
+
+/* ------------------------------------------------------------------ probing and system */
 
 function run(bin, args, timeout = 20000) {
   return new Promise((resolve, reject) => {
@@ -684,7 +982,6 @@ async function probe({ url, sdp, rtspTransport, username, password }) {
   }
 }
 
-// ---- encoder availability ----
 // ffmpeg lists hardware encoders (NVENC, QSV, AMF) even on machines without the hardware, so each one is
 // tried on a tiny test clip. true = works, false = fails, null = still being tested.
 const ENCODER_LIST = {
@@ -710,10 +1007,10 @@ async function detectEncoders() {
 async function systemInfo() {
   try {
     const out = await run(FFMPEG, ['-version'], 5000);
-    return { ok: true, version: out.split('\n')[0], encoders: { ...encoders } };
+    return { ok: true, version: out.split('\n')[0], encoders: { ...encoders }, font: !!ff.findFont() };
   } catch (e) {
     return { ok: false, error: `ffmpeg not found (${FFMPEG}). Install it or set FFMPEG_PATH.` };
   }
 }
 
-module.exports = { Manager, probe, systemInfo, detectEncoders, hlsStore, MEDIA_DIR, MEDIA_EXT };
+module.exports = { Manager, probe, systemInfo, detectEncoders, hlsStore, relay, MEDIA_DIR, MEDIA_EXT, LOGO_DIR, LOGO_EXT };

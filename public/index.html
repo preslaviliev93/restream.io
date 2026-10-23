@@ -46,6 +46,7 @@
       <div class="seg" id="srcType">
         <label><input type="radio" name="_src" value="url" checked> Network stream or address</label>
         <label><input type="radio" name="_src" value="media"> Video stored on this server</label>
+        <label><input type="radio" name="_src" value="listen"> Wait for a camera or encoder to send</label>
       </div>
       <div data-src="url">
       <label>Where does the stream come from?
@@ -78,6 +79,26 @@
           <span id="mediaProg" class="note"></span>
         </div>
         <small>Select several videos to play them one after another, in the order you click them. For a smooth playlist use videos with the same format and size, or pick a re-encoding option in the next step.</small>
+      </div>
+
+      <div data-src="listen" hidden>
+        <p class="lead">Let a camera or encoder (such as OBS) send its stream to this server</p>
+        <div class="two">
+          <label>Protocol
+            <select name="input.listen.protocol"><option value="rtmp">RTMP (OBS and most cameras)</option><option value="srt">SRT</option></select>
+          </label>
+          <label>Port to listen on
+            <input type="number" min="1" max="65535" name="input.listen.port" placeholder="1935">
+          </label>
+        </div>
+        <label data-for="rtmpkey">Stream key
+          <input name="input.listen.key" placeholder="stream" autocomplete="off">
+        </label>
+        <label data-for="srtpass">Passphrase (optional, 10 to 79 characters)
+          <input type="password" name="input.listen.passphrase" autocomplete="new-password" id="lisPass">
+        </label>
+        <div class="push-url" id="pushUrl"></div>
+        <small>Enter this address in the camera or encoder. The stream starts when it connects, and goes back to waiting if it disconnects. The port must be reachable from the sender (open it in the firewall if needed).</small>
       </div>
 
       <label class="toggle" data-for="loop"><input type="checkbox" name="input.loop"><span><b>Loop forever</b> - start again from the beginning when the video ends, so the stream never stops</span></label>
@@ -148,6 +169,80 @@
         </div>
         <label data-for="atx" class="narrow">Sample rate (Hz)<input type="number" min="0" name="audio.sampleRate" placeholder="as source"></label>
       </div>
+
+      <details class="fx" id="fxBox">
+        <summary>Picture and sound adjustments</summary>
+        <p class="note">These apply to every destination, the recording and the preview. Any picture adjustment re-encodes the video, so it uses more CPU and overrides "pass through".</p>
+
+        <h4>Picture</h4>
+        <div class="grid3">
+          <label>Rotate
+            <select name="picture.rotate"><option value="0">No rotation</option><option value="90">90 degrees right</option><option value="180">180 degrees</option><option value="270">90 degrees left</option></select>
+          </label>
+          <label class="check"><input type="checkbox" name="picture.flipH"> Flip left to right</label>
+          <label class="check"><input type="checkbox" name="picture.flipV"> Flip upside down</label>
+        </div>
+        <label class="toggle"><input type="checkbox" name="picture.deinterlace"><span><b>Deinterlace</b> - removes combing lines from interlaced video</span></label>
+        <p class="lead small">Crop (pixels to cut from each edge)</p>
+        <div class="grid4">
+          <label>Left<input type="number" min="0" name="picture.crop.left" placeholder="0"></label>
+          <label>Right<input type="number" min="0" name="picture.crop.right" placeholder="0"></label>
+          <label>Top<input type="number" min="0" name="picture.crop.top" placeholder="0"></label>
+          <label>Bottom<input type="number" min="0" name="picture.crop.bottom" placeholder="0"></label>
+        </div>
+
+        <h4>Text</h4>
+        <label class="toggle"><input type="checkbox" name="picture.text.enabled" id="txtOn"><span><b>Show text on the picture</b></span></label>
+        <div class="indent" id="txtOpts" hidden>
+          <label>Text
+            <input name="picture.text.content" maxlength="120" placeholder="Camera 1 - Lobby" autocomplete="off">
+          </label>
+          <label class="toggle"><input type="checkbox" name="picture.text.clock"><span>Add the current date and time</span></label>
+          <div class="grid4">
+            <label>Position
+              <select name="picture.text.position"><option value="top-left">Top left</option><option value="top-right">Top right</option><option value="bottom-left">Bottom left</option><option value="bottom-right">Bottom right</option><option value="center">Center</option></select>
+            </label>
+            <label>Size
+              <select name="picture.text.size"><option value="small">Small</option><option value="medium">Medium</option><option value="large">Large</option></select>
+            </label>
+            <label>Color
+              <select name="picture.text.color"><option value="white">White</option><option value="yellow">Yellow</option><option value="red">Red</option><option value="green">Green</option><option value="cyan">Cyan</option><option value="black">Black</option></select>
+            </label>
+            <label class="check"><input type="checkbox" name="picture.text.box"> Dark background</label>
+          </div>
+        </div>
+
+        <h4>Logo</h4>
+        <label class="toggle"><input type="checkbox" name="picture.logo.enabled" id="logoOn"><span><b>Add a logo image</b></span></label>
+        <div class="indent" id="logoOpts" hidden>
+          <div id="logoList" class="media-list"></div>
+          <div class="media-actions">
+            <button type="button" class="btn" id="logoUpBtn">Upload logo</button>
+            <input type="file" id="logoFile" accept="image/png,image/jpeg,image/webp" hidden>
+            <span id="logoProg" class="note"></span>
+          </div>
+          <input type="hidden" name="picture.logo.file">
+          <div class="grid3">
+            <label>Position
+              <select name="picture.logo.position"><option value="top-left">Top left</option><option value="top-right">Top right</option><option value="bottom-left">Bottom left</option><option value="bottom-right">Bottom right</option><option value="center">Center</option></select>
+            </label>
+            <label>Size (% of the picture height)<input type="number" min="3" max="40" name="picture.logo.sizePercent" placeholder="12"></label>
+            <label>Opacity (%)<input type="number" min="10" max="100" name="picture.logo.opacity" placeholder="100"></label>
+          </div>
+        </div>
+
+        <h4>Sound</h4>
+        <div class="two">
+          <label>Audio source
+            <select name="audioFx.source"><option value="original">Use the stream's own audio</option><option value="silence">Silence (adds a silent audio track)</option></select>
+          </label>
+          <label>Volume change (dB, -30 to 30)
+            <input type="number" step="1" min="-30" max="30" name="audioFx.gainDb" placeholder="0">
+          </label>
+        </div>
+        <label class="toggle"><input type="checkbox" name="audioFx.normalize"><span><b>Even out the loudness</b> - quiet parts get louder, loud parts softer</span></label>
+      </details>
+
     </section>
 
     <!-- Step 3 -->
@@ -157,7 +252,16 @@
       <button type="button" class="btn" id="addDest">Add another destination</button>
 
       <h4>Also</h4>
-      <label class="toggle"><input type="checkbox" name="preview"><span><b>Show a live preview</b> on the dashboard (low resolution, costs some CPU)</span></label>
+      <label class="toggle"><input type="checkbox" name="preview"><span><b>Show a live preview</b> in the browser (dashboard card and the Watch button)</span></label>
+      <div class="indent" id="prevOpts" hidden>
+        <label>Preview quality
+          <select name="previewQuality">
+            <option value="low">Low (360p) - lightest on the CPU</option>
+            <option value="hd">HD (720p) - sharper, uses more CPU</option>
+            <option value="copy">Original quality - no extra CPU, needs H.264 video</option>
+          </select>
+        </label>
+      </div>
       <label class="toggle"><input type="checkbox" name="record.enabled" id="recOn"><span><b>Save a copy to disk</b> (recording)</span></label>
       <div class="indent" id="recOpts" hidden>
         <div class="two">
@@ -193,6 +297,18 @@
   </form>
 </dialog>
 
+<!-- ============ Big player ============ -->
+<dialog id="watchDlg" class="watch">
+  <div class="dhead">
+    <h2 id="wName"></h2>
+    <span class="sp"></span>
+    <button type="button" class="btn" id="wSnap">Take a snapshot</button>
+    <button type="button" class="btn" id="wClose">Close</button>
+  </div>
+  <video id="wVideo" controls autoplay muted playsinline></video>
+  <p id="wNote" class="note"></p>
+</dialog>
+
 <!-- ============ Details ============ -->
 <dialog id="detailDlg" class="wide">
   <div class="dhead">
@@ -206,6 +322,7 @@
   </div>
   <nav class="tabs">
     <button data-tab="ov" class="on">Overview</button>
+    <button data-tab="out">Outputs</button>
     <button data-tab="rep">Report</button>
     <button data-tab="fmt">Format</button>
     <button data-tab="rec">Recordings</button>
@@ -228,6 +345,15 @@
     </div>
     <h4>Health</h4>
     <table class="kv" id="dTable"></table>
+  </section>
+
+  <section data-pane="out" hidden>
+    <p class="note">The source, every destination, the recording and the preview each run on their own. Switching one off does not interrupt the others.</p>
+    <div id="outList" class="out-list"></div>
+    <div class="out-actions">
+      <button type="button" class="btn" id="snapBtn">Take a snapshot</button>
+      <span id="snapMsg" class="note"></span>
+    </div>
   </section>
 
   <section data-pane="rep" hidden>
@@ -253,9 +379,12 @@
 
   <section data-pane="log" hidden>
     <details>
-      <summary>ffmpeg command line</summary>
+      <summary>ffmpeg command lines</summary>
       <pre id="dCmd" class="log wrap"></pre>
     </details>
+    <label class="log-filter">Show
+      <select id="logFilter"><option value="">Everything</option></select>
+    </label>
     <pre id="dLog" class="log"></pre>
   </section>
 </dialog>
