@@ -44,6 +44,8 @@ Environment variables:
 |---------------|-------------|----------------------------------------------|
 | `PORT`        | `3000`      | HTTP port                                    |
 | `HOST`        | `127.0.0.1` | Interface to listen on                       |
+| `AUTH_USER`   | (none)      | Username for HTTP basic auth                 |
+| `AUTH_PASS`   | (none)      | Password for HTTP basic auth                 |
 | `FFMPEG_PATH` | `ffmpeg`    | Path to the ffmpeg executable                |
 | `FFPROBE_PATH`| `ffprobe`   | Path to the ffprobe executable               |
 
@@ -53,6 +55,22 @@ Example:
 $env:PORT = 8080
 npm start
 ```
+
+## Running on a remote server
+
+By default the server only listens on localhost. To reach it from another machine, bind to all interfaces and set a login (open the chosen port in the firewall if needed):
+
+```bash
+HOST=0.0.0.0 AUTH_USER=admin AUTH_PASS=change-me npm start
+```
+
+Alternatively keep the default and use an SSH tunnel, then open http://127.0.0.1:3000 locally:
+
+```bash
+ssh -L 3000:127.0.0.1:3000 user@server
+```
+
+Basic auth sends the password unencrypted over plain HTTP, so on untrusted networks prefer the SSH tunnel or put a TLS reverse proxy in front.
 
 ## Example: RTSP to UDP
 

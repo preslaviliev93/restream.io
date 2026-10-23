@@ -1,5 +1,6 @@
 const express = require('express');
 const http = require('http');
+const crypto = require('crypto');
 const path = require('path');
 const { WebSocketServer } = require('ws');
 const { Manager, probe, systemInfo, HLS_DIR } = require('./manager');
@@ -8,8 +9,26 @@ const PORT = Number(process.env.PORT) || 3000;
 // Local tool that can spawn processes and read files: bind to loopback unless told otherwise.
 const HOST = process.env.HOST || '127.0.0.1';
 
+const AUTH_USER = process.env.AUTH_USER || '';
+const AUTH_PASS = process.env.AUTH_PASS || '';
+const authEnabled = !!(AUTH_USER && AUTH_PASS);
+
+function authorized(header) {
+  if (!authEnabled) return true;
+  const m = /^Basic (.+)$/.exec(header || '');
+  if (!m) return false;
+  const given = Buffer.from(m[1], 'base64').toString('utf8');
+  const want = Buffer.from(`${AUTH_USER}:${AUTH_PASS}`);
+  const got = Buffer.from(given);
+  return got.length === want.length && crypto.timingSafeEqual(got, want);
+}
+
 const manager = new Manager();
 const app = express();
+app.use((req, res, next) => {
+  if (authorized(req.headers.authorization)) return next();
+  res.set('WWW-Authenticate', 'Basic realm="restream"').status(401).send('Authentication required');
+});
 app.use(express.json({ limit: '256kb' }));
 
 const wrap = (fn) => (req, res) =>
@@ -32,7 +51,11 @@ app.use('/vendor/hls.js', express.static(path.join(__dirname, '..', 'node_module
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/ws' });
+const wss = new WebSocketServer({
+  server,
+  path: '/ws',
+  verifyClient: (info) => authorized(info.req.headers.authorization),
+});
 
 function tick() {
   if (!wss.clients.size) {
@@ -51,6 +74,9 @@ setInterval(tick, 1000);
 
 server.listen(PORT, HOST, () => {
   console.log(`restream.io running at http://${HOST}:${PORT}`);
+  if (!authEnabled && !['127.0.0.1', 'localhost', '::1'].includes(HOST)) {
+    console.warn('WARNING: listening on a non-loopback address without authentication. Set AUTH_USER and AUTH_PASS.');
+  }
   manager.autoStart();
 });
 
